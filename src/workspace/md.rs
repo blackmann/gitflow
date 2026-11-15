@@ -2,11 +2,23 @@
 //! notes. It draws inline code in the monospace font (GPUI highlights can't switch
 //! fonts, so text is built from runs) and spaces blocks itself.
 use super::ui::{col, row};
-use crate::theme::Palette;
+use crate::{
+    avatars::{Avatars, Source},
+    theme::Palette,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use markdown::mdast::{AlignKind, Node};
 use std::{cell::Cell, ops::Range};
+
+/// Where a README sits, so relative image paths resolve inside its repository.
+#[derive(Clone)]
+pub struct Base {
+    pub slug: String,
+    pub reference: String,
+    /// The README's folder, without slashes at either end ("" for the root).
+    pub dir: String,
+}
 
 /// How source newlines inside a paragraph read: Markdown files treat them as
 /// spaces; GitHub comments and release notes treat them as line breaks.
@@ -23,6 +35,8 @@ struct Ctx {
     mono: SharedString,
     mono_size: Pixels,
     breaks: Breaks,
+    images: Option<Avatars>,
+    base: Option<Base>,
 }
 impl Ctx {
     fn id(&self, what: &str) -> ElementId {
@@ -202,6 +216,212 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// An image in Markdown or HTML.
+#[derive(Debug, PartialEq)]
+struct Img {
+    url: String,
+    alt: String,
+    link: Option<String>,
+    width: Option<f32>,
+}
+/// A paragraph that holds images, split into text and images; None when it
+/// has no images (the common case, drawn as one run of text).
+enum Piece {
+    Text(Vec<Node>),
+    Image(Img),
+}
+fn pieces(nodes: &[Node]) -> Option<Vec<Piece>> {
+    let image_link = |n: &Node| match n {
+        Node::Link(l) => {
+            l.children.iter().any(|c| matches!(c, Node::Image(_)))
+                && l.children.iter().all(|c| matches!(c, Node::Image(_)) || matches!(c, Node::Text(t) if t.value.trim().is_empty()))
+        }
+        _ => false,
+    };
+    let has = nodes.iter().any(|n| {
+        matches!(n, Node::Image(_)) || image_link(n) || matches!(n, Node::Html(h) if h.value.to_ascii_lowercase().contains("<img"))
+    });
+    if !has {
+        return None;
+    }
+    let mut out = vec![];
+    let mut text: Vec<Node> = vec![];
+    let flush = |text: &mut Vec<Node>, out: &mut Vec<Piece>| {
+        let blank = text.iter().all(|n| matches!(n, Node::Text(t) if t.value.trim().is_empty()) || matches!(n, Node::Break(_)));
+        if !blank {
+            out.push(Piece::Text(std::mem::take(text)));
+        }
+        text.clear();
+    };
+    for n in nodes {
+        match n {
+            Node::Image(i) => {
+                flush(&mut text, &mut out);
+                out.push(Piece::Image(Img {
+                    url: i.url.clone(),
+                    alt: i.alt.clone(),
+                    link: None,
+                    width: None,
+                }));
+            }
+            Node::Link(l) if image_link(n) => {
+                flush(&mut text, &mut out);
+                for c in &l.children {
+                    if let Node::Image(i) = c {
+                        out.push(Piece::Image(Img {
+                            url: i.url.clone(),
+                            alt: i.alt.clone(),
+                            link: Some(l.url.clone()),
+                            width: None,
+                        }));
+                    }
+                }
+            }
+            Node::Html(h) if h.value.to_ascii_lowercase().contains("<img") => {
+                flush(&mut text, &mut out);
+                out.extend(html_images(&h.value).into_iter().map(Piece::Image));
+            }
+            other => text.push(other.clone()),
+        }
+    }
+    flush(&mut text, &mut out);
+    Some(out)
+}
+/// `<img>` tags in raw HTML: source, alt text and width.
+fn html_images(html: &str) -> Vec<Img> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = vec![];
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("<img") {
+        let start = from + at;
+        let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+        let tag = &html[start..end];
+        let attr = |name: &str| -> Option<String> {
+            let tl = tag.to_ascii_lowercase();
+            let mut search = 0;
+            while let Some(i) = tl[search..].find(name) {
+                let i = search + i;
+                search = i + name.len();
+                // A whole attribute name, followed by `=`.
+                let before = tl[..i].chars().last().unwrap_or(' ');
+                let after = tl[i + name.len()..].trim_start();
+                if !before.is_whitespace() || !after.starts_with('=') {
+                    continue;
+                }
+                let value = after[1..].trim_start();
+                let offset = tag.len() - value.len();
+                let raw = &tag[offset..];
+                return Some(match raw.chars().next() {
+                    Some(q @ ('"' | '\'')) => raw[1..].split(q).next().unwrap_or("").to_string(),
+                    _ => raw.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("").to_string(),
+                });
+            }
+            None
+        };
+        if let Some(url) = attr("src").filter(|u| !u.is_empty()) {
+            out.push(Img {
+                url,
+                alt: attr("alt").unwrap_or_default(),
+                link: None,
+                width: attr("width").and_then(|w| w.trim_end_matches("px").parse().ok()),
+            });
+        }
+        from = end;
+    }
+    out
+}
+/// Resolve an image URL: absolute URLs as they are, relative paths inside the
+/// README's repository.
+fn resolve(url: &str, base: Option<&Base>) -> Option<Source> {
+    let url = url.trim();
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return Some(Source::Url(url.to_string()));
+    }
+    if let Some(rest) = url.strip_prefix("//") {
+        return Some(Source::Url(format!("https://{rest}")));
+    }
+    if url.contains(':') || url.starts_with('#') {
+        return None;
+    }
+    let base = base?;
+    let clean = url.split(['?', '#']).next().unwrap_or("");
+    let mut parts: Vec<&str> = if clean.starts_with('/') {
+        vec![]
+    } else {
+        base.dir.split('/').filter(|p| !p.is_empty()).collect()
+    };
+    for p in clean.split('/') {
+        match p {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    Some(Source::Repo {
+        slug: base.slug.clone(),
+        reference: base.reference.clone(),
+        path: parts.join("/"),
+    })
+}
+fn image(i: Img, cx: &Ctx) -> AnyElement {
+    let colors = cx.colors;
+    let src = resolve(&i.url, cx.base.as_ref());
+    let loaded = match (&cx.images, &src) {
+        (Some(images), Some(src)) => images.image(src),
+        _ => Err(()),
+    };
+    let alt = if i.alt.is_empty() { "image".to_string() } else { i.alt.clone() };
+    let el = match loaded {
+        Ok(Some(data)) => img(data)
+            .max_w_full()
+            .when_some(i.width, |m, w| m.w(px(w)))
+            .into_any_element(),
+        Ok(None) => div()
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .bg(rgb(colors.hover))
+            .text_size(px(12.))
+            .text_color(rgb(colors.quiet))
+            .child(alt)
+            .into_any_element(),
+        Err(()) => div().text_size(px(12.)).text_color(rgb(colors.muted)).child(format!("[{alt}]")).into_any_element(),
+    };
+    // Linked images open their link; others open the image itself.
+    let target = i.link.or(match &src {
+        Some(Source::Url(u)) => Some(u.clone()),
+        _ => None,
+    });
+    match target.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+        Some(url) => div()
+            .id(cx.id("img"))
+            .max_w_full()
+            .cursor_pointer()
+            .child(el)
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element(),
+        None => div().max_w_full().child(el).into_any_element(),
+    }
+}
+/// Text and images in reading order; images wrap like inline content (badge
+/// rows) and are never wider than the column.
+fn render_pieces(parts: Vec<Piece>, cx: &Ctx) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(6.))
+        .line_height(relative(1.55))
+        .children(parts.into_iter().map(|p| match p {
+            Piece::Text(nodes) => div().max_w_full().child(inline(&nodes, cx)).into_any_element(),
+            Piece::Image(i) => image(i, cx),
+        }))
+        .into_any_element()
+}
+
 fn blocks(nodes: &[Node], cx: &Ctx) -> Vec<AnyElement> {
     nodes.iter().filter_map(|n| block(n, cx)).collect()
 }
@@ -209,7 +429,10 @@ fn blocks(nodes: &[Node], cx: &Ctx) -> Vec<AnyElement> {
 fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
     let colors = cx.colors;
     Some(match node {
-        Node::Paragraph(p) => div().w_full().line_height(relative(1.55)).child(inline(&p.children, cx)).into_any_element(),
+        Node::Paragraph(p) => match pieces(&p.children) {
+            Some(parts) => render_pieces(parts, cx),
+            None => div().w_full().line_height(relative(1.55)).child(inline(&p.children, cx)).into_any_element(),
+        },
         Node::Heading(h) => {
             let size = match h.depth {
                 1 => 20.,
@@ -352,7 +575,23 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
             table.into_any_element()
         }
         Node::Html(h) => {
+            let images = html_images(&h.value);
             let text = strip_tags(&h.value);
+            if !images.is_empty() {
+                // `<p align="center"><img …></p>` and pasted screenshots.
+                let centered = h.value.to_ascii_lowercase().contains("align=\"center\"");
+                return Some(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .when(centered, |d| d.justify_center())
+                        .children(images.into_iter().map(|i| image(i, cx)))
+                        .when(!text.is_empty(), |d| d.child(div().w_full().text_color(rgb(colors.muted)).child(text)))
+                        .into_any_element(),
+                );
+            }
             if text.is_empty() {
                 return None;
             }
@@ -368,7 +607,17 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
 }
 
 /// Render Markdown text. Unparsable input falls back to plain text.
-pub fn render(id: SharedString, text: &str, breaks: Breaks, colors: Palette, mono: SharedString, mono_size: Pixels) -> AnyElement {
+#[allow(clippy::too_many_arguments)]
+pub fn render(
+    id: SharedString,
+    text: &str,
+    breaks: Breaks,
+    colors: Palette,
+    mono: SharedString,
+    mono_size: Pixels,
+    images: Option<Avatars>,
+    base: Option<Base>,
+) -> AnyElement {
     let cx = Ctx {
         id,
         next: Cell::new(0),
@@ -376,6 +625,8 @@ pub fn render(id: SharedString, text: &str, breaks: Breaks, colors: Palette, mon
         mono,
         mono_size,
         breaks,
+        images,
+        base,
     };
     match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
         Ok(Node::Root(root)) => col()
@@ -391,7 +642,30 @@ pub fn render(id: SharedString, text: &str, breaks: Breaks, colors: Palette, mon
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the built-in one.
-    use super::{Breaks, Inline, Node, Style, strip_tags};
+    use super::{Base, Breaks, Img, Inline, Node, Style, html_images, resolve, strip_tags};
+    use crate::avatars::Source;
+    #[test]
+    fn reads_img_tags() {
+        let imgs = html_images(r#"<p align="center"><img width="320" alt="Shot" src="https://github.com/user-attachments/assets/x"></p><IMG SRC='a.png'>"#);
+        assert_eq!(
+            imgs,
+            vec![
+                Img { url: "https://github.com/user-attachments/assets/x".into(), alt: "Shot".into(), link: None, width: Some(320.) },
+                Img { url: "a.png".into(), alt: String::new(), link: None, width: None },
+            ]
+        );
+    }
+    #[test]
+    fn resolves_relative_images_in_the_repo() {
+        let base = Base { slug: "o/r".into(), reference: "main".into(), dir: "docs/guide".into() };
+        let repo = |p: &str| Some(Source::Repo { slug: "o/r".into(), reference: "main".into(), path: p.into() });
+        assert_eq!(resolve("img/a.png", Some(&base)), repo("docs/guide/img/a.png"));
+        assert_eq!(resolve("./../b.png?raw=1", Some(&base)), repo("docs/b.png"));
+        assert_eq!(resolve("/assets/c.svg", Some(&base)), repo("assets/c.svg"));
+        assert_eq!(resolve("https://x.dev/a.png", None), Some(Source::Url("https://x.dev/a.png".into())));
+        assert_eq!(resolve("a.png", None), None);
+        assert_eq!(resolve("data:image/png;base64,xx", Some(&base)), None);
+    }
     fn flatten(src: &str, breaks: Breaks) -> Inline {
         let Ok(Node::Root(root)) = markdown::to_mdast(src, &markdown::ParseOptions::gfm()) else {
             panic!()

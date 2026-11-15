@@ -57,6 +57,10 @@ pub struct Load<T> {
     pub data: Option<T>,
     pub error: Option<String>,
     pub loading: bool,
+    /// `data` came from the disk cache and a live request is still running.
+    pub stale: bool,
+    /// When a view last asked for this, for dropping the least recently used.
+    pub used: u64,
 }
 impl<T> Default for Load<T> {
     fn default() -> Self {
@@ -64,6 +68,8 @@ impl<T> Default for Load<T> {
             data: None,
             error: None,
             loading: false,
+            stale: false,
+            used: 0,
         }
     }
 }
@@ -87,6 +93,9 @@ pub enum BlobView {
 /// A diff flattened for a virtualized list: file headers, then numbered lines.
 pub struct DiffView {
     pub files: Vec<gh::FileDiff>,
+    /// Each file's shown lines, tabs expanded, and their syntax colours.
+    pub text: Vec<Vec<SharedString>>,
+    pub highlights: Vec<Option<syntax::Highlights>>,
     pub rows: Vec<(usize, Option<usize>)>,
     pub additions: u32,
     pub deletions: u32,
@@ -99,7 +108,18 @@ impl DiffView {
             rows.push((f, None));
             rows.extend((0..file.lines.len().min(Self::MAX_LINES)).map(|l| (f, Some(l))));
         }
+        let text: Vec<Vec<SharedString>> = files
+            .iter()
+            .map(|f| f.lines.iter().take(Self::MAX_LINES).map(|l| SharedString::from(l.text.replace('\t', "    "))).collect())
+            .collect();
+        let highlights = files
+            .iter()
+            .zip(&text)
+            .map(|(f, t)| if f.binary { None } else { syntax::highlight_diff(&f.path, &f.lines[..t.len()], t) })
+            .collect();
         Self {
+            text,
+            highlights,
             additions: files.iter().map(|f| f.additions).sum(),
             deletions: files.iter().map(|f| f.deletions).sum(),
             files,
@@ -147,13 +167,97 @@ pub struct RepoData {
     pub log: HashMap<u64, Load<Arc<LogView>>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum PrPage {
     #[default]
     Conversation,
     Commits,
     Files,
     Checks,
+}
+
+/// A line of a pull request diff, as GitHub addresses review comments.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LineTarget {
+    pub path: String,
+    pub line: u32,
+    /// The new (right) side for additions and context, old (left) for deletions.
+    pub right: bool,
+}
+
+/// The open tabs, saved so the next launch reopens them where they were.
+#[derive(Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Session {
+    #[serde(default)]
+    tabs: Vec<SavedTab>,
+    #[serde(default)]
+    active: Option<usize>,
+}
+#[derive(Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SavedTab {
+    repo: String,
+    view: View,
+    branch: Option<String>,
+    graph_ref: Option<String>,
+    path: String,
+    file: Option<String>,
+    commit: Option<String>,
+    pr_filter: PrFilter,
+    pr: Option<u64>,
+    pr_page: PrPage,
+    workflow: Option<u64>,
+    run: Option<u64>,
+    job: Option<u64>,
+    log_open: bool,
+}
+impl Session {
+    const FILE: &str = "session.json";
+    fn load() -> Self {
+        settings::support_dir()
+            .and_then(|d| std::fs::read(d.join(Self::FILE)).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self) {
+        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
+            let _ = settings::write(Self::FILE, bytes);
+        }
+    }
+}
+impl SavedTab {
+    fn of(t: &Tab) -> Self {
+        Self {
+            repo: t.repo.clone(),
+            view: t.view,
+            branch: t.branch.clone(),
+            graph_ref: t.graph_ref.clone(),
+            path: t.path.clone(),
+            file: t.file.clone(),
+            commit: t.commit.clone(),
+            pr_filter: t.pr_filter,
+            pr: t.pr,
+            pr_page: t.pr_page,
+            workflow: t.workflow,
+            run: t.run,
+            job: t.job,
+            log_open: t.log_open,
+        }
+    }
+    fn apply(self, t: &mut Tab) {
+        t.branch = self.branch;
+        t.graph_ref = self.graph_ref;
+        t.path = self.path;
+        t.file = self.file;
+        t.commit = self.commit;
+        t.pr_filter = self.pr_filter;
+        t.pr = self.pr;
+        t.pr_page = self.pr_page;
+        t.workflow = self.workflow;
+        t.run = self.run;
+        t.job = self.job;
+        t.log_open = self.log_open;
+    }
 }
 
 pub struct Tab {
@@ -176,6 +280,14 @@ pub struct Tab {
     pub log_open: bool,
     pub search: Entity<InputState>,
     pub composer: Entity<InputState>,
+    /// The pull request diff line being commented on, and its comment box.
+    pub line_target: Option<LineTarget>,
+    /// The first line when a range is selected (`line_target` is the last).
+    pub line_start: Option<LineTarget>,
+    /// The selected diff rows, and the row a shift-click extends from.
+    pub line_rows: (usize, usize),
+    pub line_anchor: usize,
+    pub line_composer: Entity<InputState>,
     pub list_scroll: UniformListScrollHandle,
     pub diff_scroll: UniformListScrollHandle,
     pub log_scroll: UniformListScrollHandle,
@@ -232,6 +344,8 @@ pub struct Workspace {
     busy: Option<String>,
     /// Clear this tab's comment box on the next frame (needs a window).
     pending_clear: Option<u64>,
+    /// Likewise for a tab's line comment box.
+    pending_line_clear: Option<u64>,
     user: Load<gh::User>,
     gh_version: Load<String>,
     prefs_open: bool,
@@ -249,6 +363,14 @@ pub struct Workspace {
     activity_hover: Option<usize>,
     /// The hovered line in the file viewer, for inline blame.
     code_hover: Option<usize>,
+    /// Views showing cached data while their live request runs.
+    refreshing: usize,
+    /// Counts fetch requests; stamps `Load::used`.
+    tick: u64,
+    /// The tabs as last saved.
+    session: Option<Session>,
+    /// The first row a diff list last drew, so its pinned file header keeps up.
+    diff_top: usize,
     focus: FocusHandle,
 }
 
@@ -297,6 +419,7 @@ impl Workspace {
             font_names: Rc::default(),
             notice: None,
             busy: None,
+            pending_line_clear: None,
             pending_clear: None,
             user: Load::default(),
             gh_version: Load::default(),
@@ -312,10 +435,19 @@ impl Workspace {
             last_repo_poll: None,
             activity_hover: None,
             code_hover: None,
+            refreshing: 0,
+            tick: 0,
+            session: None,
+            diff_top: 0,
             focus,
         };
+        // Markdown views load images through the same cache as avatars.
+        cx.set_global(s.avatars.clone());
         s.load_account(cx);
-        if let Some(first) = s.repos.first().map(Repo::key) {
+        s.restore_session(window, cx);
+        if s.tabs.is_empty()
+            && let Some(first) = s.repos.first().map(Repo::key)
+        {
             s.open_repo(&first, window, cx);
         }
         cx.spawn_in(window, async move |this, cx| {
@@ -351,6 +483,12 @@ impl Workspace {
                 .auto_grow(3, 12)
                 .placeholder("Leave a comment · Markdown supported")
         });
+        let line_composer = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 8)
+                .placeholder("Comment on this line · Markdown supported")
+        });
         Tab {
             id: self.next_id,
             repo: repo.to_string(),
@@ -369,6 +507,11 @@ impl Workspace {
             log_open: false,
             search,
             composer,
+            line_target: None,
+            line_start: None,
+            line_rows: (0, 0),
+            line_anchor: 0,
+            line_composer,
             list_scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
             log_scroll: UniformListScrollHandle::new(),
@@ -460,20 +603,52 @@ impl Workspace {
         repo: &str,
         slot: impl Fn(&mut RepoData) -> &mut Load<T> + 'static,
         force: bool,
-        job: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+        job: impl Fn() -> anyhow::Result<T> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        self.tick += 1;
         let l = slot(self.data.entry(repo.to_string()).or_default());
+        l.used = self.tick;
         if l.loading || (!force && !l.pending()) {
             return;
         }
         l.loading = true;
+        // With nothing to show yet, show the last session's copy first.
+        let try_cache = l.data.is_none();
         let repo = repo.to_string();
         cx.spawn(async move |this, cx| {
+            let mut counted = false;
+            let job = if try_cache {
+                let (job, cached) = smol::unblock(move || {
+                    let r = crate::cache::cached_only(&job);
+                    (job, r)
+                })
+                .await;
+                if let Ok(v) = cached {
+                    let _ = this.update(cx, |s, cx| {
+                        let l = slot(s.data.entry(repo.clone()).or_default());
+                        // A slot cleared or filled meanwhile is left alone.
+                        if l.loading && l.data.is_none() {
+                            l.data = Some(v);
+                            l.stale = true;
+                            s.refreshing += 1;
+                            counted = true;
+                            cx.notify();
+                        }
+                    });
+                }
+                job
+            } else {
+                job
+            };
             let result = smol::unblock(job).await;
             let _ = this.update(cx, |s, cx| {
                 let l = slot(s.data.entry(repo).or_default());
                 l.loading = false;
+                l.stale = false;
+                if counted {
+                    s.refreshing = s.refreshing.saturating_sub(1);
+                }
                 match result {
                     Ok(v) => {
                         l.data = Some(v);
@@ -507,7 +682,34 @@ impl Workspace {
     }
 
     /// Request whatever the active tab shows. With `force`, re-fetch it.
+    /// Keep memory flat over a long session: files, diffs and logs viewed a
+    /// while ago are dropped (the disk cache brings them back quickly).
+    fn trim_memory(&mut self) {
+        fn trim<K: Clone + Eq + std::hash::Hash, T>(map: &mut HashMap<K, Load<T>>, cap: usize) {
+            if map.len() <= cap {
+                return;
+            }
+            let mut idle: Vec<(u64, K)> = map.iter().filter(|(_, l)| !l.loading).map(|(k, l)| (l.used, k.clone())).collect();
+            idle.sort_by_key(|(used, _)| *used);
+            let excess = map.len() - cap;
+            for (_, k) in idle.into_iter().take(excess) {
+                map.remove(&k);
+            }
+        }
+        for d in self.data.values_mut() {
+            trim(&mut d.blob, 30);
+            trim(&mut d.blame, 30);
+            trim(&mut d.tree, 60);
+            trim(&mut d.folder, 60);
+            trim(&mut d.pull, 30);
+            trim(&mut d.pull_diff, 10);
+            trim(&mut d.commit, 30);
+            trim(&mut d.jobs, 30);
+            trim(&mut d.log, 10);
+        }
+    }
     fn ensure(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.trim_memory();
         let Some(t) = self.current() else { return };
         let key = t.repo.clone();
         let Some(repo) = self.repo(&key).cloned() else {
@@ -756,7 +958,40 @@ impl Workspace {
         }
     }
     /// Periodic work: repaint for avatars, auto-refresh, and poll running Actions.
+    /// Reopen last launch's tabs, skipping repositories since removed.
+    fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = Session::load();
+        let mut active = None;
+        for (i, st) in saved.tabs.into_iter().enumerate() {
+            if self.repo(&st.repo).is_none() {
+                continue;
+            }
+            let mut tab = self.new_tab(&st.repo, st.view, window, cx);
+            st.apply(&mut tab);
+            if saved.active == Some(i) {
+                active = Some(self.tabs.len());
+            }
+            self.tabs.push(tab);
+        }
+        self.active = active.or((!self.tabs.is_empty()).then_some(0));
+        self.session = Some(self.session_now());
+    }
+    fn session_now(&self) -> Session {
+        Session {
+            tabs: self.tabs.iter().map(SavedTab::of).collect(),
+            active: self.active,
+        }
+    }
+    /// Save the tabs whenever they change (checked on the UI tick).
+    fn save_session(&mut self) {
+        let now = self.session_now();
+        if self.session.as_ref() != Some(&now) {
+            now.save();
+            self.session = Some(now);
+        }
+    }
     fn tick(&mut self, cx: &mut Context<Self>) {
+        self.save_session();
         if self.avatars.take_dirty() {
             cx.notify();
         }
@@ -862,7 +1097,10 @@ impl Workspace {
             gh::PrAction::Ready => format!("Marking #{number} ready"),
             gh::PrAction::Draft => format!("Converting #{number} to draft"),
             gh::PrAction::Checkout(_) => format!("Checking out #{number}"),
+            gh::PrAction::LineComment { path, line, .. } => format!("Commenting on {path}:{line}"),
+            gh::PrAction::Reply { .. } => format!("Commenting on #{number}"),
         };
+        let clears_line = matches!(action, gh::PrAction::LineComment { .. } | gh::PrAction::Reply { .. });
         let clears_composer = matches!(
             action,
             gh::PrAction::Comment(_) | gh::PrAction::RequestChanges(_)
@@ -875,11 +1113,17 @@ impl Workspace {
                 if let Some(d) = s.data.get_mut(&key) {
                     d.pull.remove(&number);
                     d.pulls.clear();
-                    d.pull_diff.remove(&number);
+                    if !clears_line {
+                        d.pull_diff.remove(&number);
+                    }
                     d.commits.clear();
                 }
                 if clears_composer {
                     s.pending_clear = Some(tab);
+                }
+                if clears_line {
+                    // The diff itself is unchanged; keep it and its scroll position.
+                    s.pending_line_clear = Some(tab);
                 }
                 s.ensure(false, cx);
             },
@@ -1229,7 +1473,7 @@ impl Workspace {
                     .unwrap_or_default()
             }
             View::Commits => t.commit = None,
-            View::Pulls => t.pr = None,
+            View::Pulls => (t.pr, t.line_target) = (None, None),
             View::Actions if t.log_open => t.log_open = false,
             View::Actions => t.run = None,
             _ => {}
@@ -1242,12 +1486,44 @@ impl Workspace {
             return;
         }
         let Some(t) = self.current() else { return };
+        if let (View::Pulls, Some(n), PrPage::Files, true) = (t.view, t.pr, t.pr_page, t.line_target.is_some()) {
+            self.submit_line(n, cx);
+            return;
+        }
         if let (View::Pulls, Some(n)) = (t.view, t.pr) {
             let body = t.composer.read(cx).value().trim().to_string();
             if !body.is_empty() {
                 self.pr_action(n, gh::PrAction::Comment(body), cx);
             }
         }
+    }
+}
+
+impl Workspace {
+    /// Post the line comment box: a reply when the line already has a thread.
+    fn submit_line(&mut self, n: u64, cx: &mut Context<Self>) {
+        let Some(t) = self.current() else { return };
+        let Some(target) = t.line_target.clone() else { return };
+        let body = t.line_composer.read(cx).value().trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let Some(pr) = self.data(&t.repo).and_then(|d| d.pull.get(&n)).and_then(|l| l.data.as_ref()) else {
+            return;
+        };
+        let existing = pr.threads.iter().rev().find(|th| diff::thread_target(th).as_ref() == Some(&target));
+        let action = match existing {
+            Some(th) => gh::PrAction::Reply { to: th.root.id, body },
+            None => gh::PrAction::LineComment {
+                commit: pr.head_ref_oid.clone(),
+                start: t.line_start.as_ref().map(|s| (s.line, s.right)),
+                path: target.path,
+                line: target.line,
+                right: target.right,
+                body,
+            },
+        };
+        self.pr_action(n, action, cx);
     }
 }
 

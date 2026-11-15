@@ -218,13 +218,14 @@ pub fn clean_markdown(text: &str) -> String {
 }
 /// Markdown as GitHub shows comments and release notes: newlines are line breaks.
 pub fn markdown(id: impl Into<SharedString>, text: &str, _window: &mut Window, cx: &mut App) -> AnyElement {
-    render_md(id.into(), text, super::md::Breaks::Hard, cx)
+    render_md(id.into(), text, super::md::Breaks::Hard, None, cx)
 }
 /// Markdown as GitHub shows `.md` files: wrapped lines join into paragraphs.
-pub fn markdown_doc(id: impl Into<SharedString>, text: &str, cx: &mut App) -> AnyElement {
-    render_md(id.into(), text, super::md::Breaks::Soft, cx)
+/// `base` places the file in its repository, for relative image paths.
+pub fn markdown_doc(id: impl Into<SharedString>, text: &str, base: Option<super::md::Base>, cx: &mut App) -> AnyElement {
+    render_md(id.into(), text, super::md::Breaks::Soft, base, cx)
 }
-fn render_md(id: SharedString, text: &str, breaks: super::md::Breaks, cx: &App) -> AnyElement {
+fn render_md(id: SharedString, text: &str, breaks: super::md::Breaks, base: Option<super::md::Base>, cx: &App) -> AnyElement {
     super::md::render(
         id,
         &clean_markdown(text),
@@ -232,6 +233,8 @@ fn render_md(id: SharedString, text: &str, breaks: super::md::Breaks, cx: &App) 
         palette(cx),
         settings::mono(cx),
         px(settings::get(cx).mono_size as f32),
+        cx.try_global::<crate::avatars::Avatars>().cloned(),
+        base,
     )
 }
 

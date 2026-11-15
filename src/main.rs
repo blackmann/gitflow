@@ -1,4 +1,5 @@
 mod avatars;
+mod cache;
 mod gh;
 mod graph;
 mod icons;
@@ -12,6 +13,8 @@ use gpui_component::{Root, TitleBar};
 use workspace::*;
 
 fn main() {
+    // Trim the disk cache off the main thread.
+    std::thread::spawn(cache::prune);
     Application::new().with_assets(icons::Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::init(cx);

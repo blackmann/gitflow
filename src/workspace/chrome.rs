@@ -73,6 +73,18 @@ impl Workspace {
                                 .child(format!("{busy}…")),
                         )
                     })
+                    // Cached data is on screen while the live copy loads.
+                    .when(self.busy.is_none() && self.refreshing > 0, |s| {
+                        s.child(
+                            row()
+                                .gap(px(6.))
+                                .mr_2()
+                                .text_size(px(12.))
+                                .text_color(rgb(colors.muted))
+                                .child(spinner(colors))
+                                .child("Refreshing…"),
+                        )
+                    })
                     .when(tab.is_some(), |s| {
                         s.child(
                             icon_button("refresh", Glyph::Refresh, "Refresh · ⌘ R")
@@ -1275,6 +1287,8 @@ impl Workspace {
             (colors.amber, colors.amber_tint)
         };
         row()
+            .id("notice")
+            .occlude()
             .absolute()
             .bottom(px(40.))
             .right(px(16.))
@@ -1335,6 +1349,11 @@ impl Render for Workspace {
             && let Some(t) = self.tabs.iter().find(|t| t.id == id)
         {
             t.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if let Some(id) = self.pending_line_clear.take()
+            && let Some(t) = self.tabs.iter().find(|t| t.id == id)
+        {
+            t.line_composer.update(cx, |s, cx| s.set_value("", window, cx));
         }
         let colors = palette(cx);
         let center = if self.current().is_some() {

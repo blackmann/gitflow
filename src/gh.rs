@@ -44,7 +44,10 @@ fn search_path() -> String {
     parts.join(":")
 }
 
-fn run(mut cmd: Command, stdin: Option<&str>, what: &str) -> Result<String> {
+fn run(cmd: Command, stdin: Option<&str>, what: &str) -> Result<String> {
+    run_bytes(cmd, stdin, what).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+fn run_bytes(mut cmd: Command, stdin: Option<&str>, what: &str) -> Result<Vec<u8>> {
     cmd.env("PATH", search_path())
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -72,7 +75,7 @@ fn run(mut cmd: Command, stdin: Option<&str>, what: &str) -> Result<String> {
     }
     let out = child.wait_with_output()?;
     if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        return Ok(out.stdout);
     }
     let err = String::from_utf8_lossy(&out.stderr);
     let err = err.trim();
@@ -95,6 +98,10 @@ pub fn gh(args: &[&str]) -> Result<String> {
 /// `cwd` matters for commands that act on a clone (checkout). Others run from
 /// HOME so a stray repository in the working directory never changes their target.
 pub fn gh_in(args: &[&str], cwd: Option<&Path>, stdin: Option<&str>) -> Result<String> {
+    let cacheable = cwd.is_none() && stdin.is_none() && crate::cache::cacheable(args);
+    if crate::cache::is_cached_only() {
+        return cacheable.then(|| crate::cache::read(args)).flatten().ok_or_else(|| anyhow!("Not cached"));
+    }
     let mut cmd = Command::new(gh_executable());
     cmd.args(args);
     match cwd {
@@ -107,9 +114,31 @@ pub fn gh_in(args: &[&str], cwd: Option<&Path>, stdin: Option<&str>) -> Result<S
             }
         }
     }
-    run(cmd, stdin, "gh")
+    let out = run(cmd, stdin, "gh")?;
+    if cacheable {
+        crate::cache::write(args, &out);
+    }
+    Ok(out)
+}
+/// A file's raw bytes (e.g. an image a README links by relative path), through
+/// `gh` so private repositories work. Not cached on disk.
+pub fn raw_file(slug: &str, path: &str, reference: &str) -> Result<Vec<u8>> {
+    let mut cmd = Command::new(gh_executable());
+    cmd.args(["api", "-H", "Accept: application/vnd.github.raw", &contents_url(slug, path, reference)]);
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
+    run_bytes(cmd, None, "gh")
+}
+/// The signed-in token, for fetching images GitHub keeps behind sign-in.
+pub fn token() -> Option<String> {
+    gh(&["auth", "token"]).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 pub fn git(path: &Path, args: &[&str]) -> Result<String> {
+    // Local clones answer quickly; the cached pass leaves them to the live one.
+    if crate::cache::is_cached_only() {
+        return Err(anyhow!("Not cached"));
+    }
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(path).args(args);
     run(cmd, None, "git")
@@ -889,7 +918,7 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
 
 // ── Pull requests ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, serde::Serialize, Deserialize)]
 pub enum PrFilter {
     #[default]
     Open,
@@ -1099,6 +1128,9 @@ pub struct PullDetail {
     pub mergeable: String,
     #[serde(default)]
     pub merge_state_status: String,
+    /// The head commit, which new review comments attach to.
+    #[serde(default)]
+    pub head_ref_oid: String,
     /// Inline code-review comments, grouped into threads (filled separately).
     #[serde(skip)]
     pub threads: Vec<Thread>,
@@ -1120,6 +1152,14 @@ pub struct ReviewComment {
     pub line: Option<u64>,
     #[serde(default)]
     pub original_line: Option<u64>,
+    /// "RIGHT" (new code) or "LEFT" (removed code).
+    #[serde(default)]
+    pub side: Option<String>,
+    /// The first line and side of a multi-line comment.
+    #[serde(default)]
+    pub start_line: Option<u64>,
+    #[serde(default)]
+    pub start_side: Option<String>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -1159,7 +1199,7 @@ pub fn pull(slug: &str, number: u64) -> Result<PullDetail> {
         slug,
         "--json",
         &format!(
-            "{PULL_FIELDS},body,url,mergedAt,closedAt,changedFiles,comments,reviews,commits,mergeable,mergeStateStatus"
+            "{PULL_FIELDS},body,url,mergedAt,closedAt,changedFiles,comments,reviews,commits,mergeable,mergeStateStatus,headRefOid"
         ),
     ])?)?;
     // Review threads are optional: a failure here still shows the conversation.
@@ -1197,6 +1237,18 @@ pub enum PrAction {
     Ready,
     Draft,
     Checkout(PathBuf),
+    /// Start a review thread on one line of the diff.
+    LineComment {
+        commit: String,
+        /// The first line and side of a multi-line comment.
+        start: Option<(u32, bool)>,
+        path: String,
+        line: u32,
+        right: bool,
+        body: String,
+    },
+    /// Answer an existing review thread.
+    Reply { to: u64, body: String },
 }
 pub fn pr_action(slug: &str, number: u64, action: &PrAction) -> Result<String> {
     let n = number.to_string();
@@ -1237,6 +1289,34 @@ pub fn pr_action(slug: &str, number: u64, action: &PrAction) -> Result<String> {
             gh(&a)
         }
         PrAction::Checkout(path) => gh_in(&["pr", "checkout", &n], Some(path), None),
+        PrAction::LineComment {
+            commit,
+            start,
+            path,
+            line,
+            right,
+            body,
+        } => {
+            let side = |right: bool| if right { "RIGHT" } else { "LEFT" };
+            let mut input = serde_json::json!({
+                "body": body,
+                "commit_id": commit,
+                "path": path,
+                "line": line,
+                "side": side(*right),
+            });
+            if let Some((first, first_right)) = start {
+                input["start_line"] = (*first).into();
+                input["start_side"] = side(*first_right).into();
+            }
+            let endpoint = format!("repos/{slug}/pulls/{number}/comments");
+            gh_in(&["api", "-X", "POST", &endpoint, "--input", "-"], None, Some(&input.to_string())).map(|_| "Comment added.".into())
+        }
+        PrAction::Reply { to, body } => {
+            let input = serde_json::json!({ "body": body });
+            let endpoint = format!("repos/{slug}/pulls/{number}/comments/{to}/replies");
+            gh_in(&["api", "-X", "POST", &endpoint, "--input", "-"], None, Some(&input.to_string())).map(|_| "Reply added.".into())
+        }
     }
 }
 
@@ -1322,6 +1402,7 @@ pub fn workflows(slug: &str) -> Result<Vec<Workflow>> {
     let mut list: Vec<Workflow> = json(&gh(&[
         "workflow", "list", "-R", slug, "--all", "-L", "100", "--json", "id,name,state,path",
     ])?)?;
+    let cached = crate::cache::is_cached_only();
     std::thread::scope(|scope| {
         let checks = list
             .iter()
@@ -1330,14 +1411,16 @@ pub fn workflows(slug: &str) -> Result<Vec<Workflow>> {
                 let readable = w.state == "active" && w.path.starts_with(".github/workflows/");
                 let path = w.path.clone();
                 scope.spawn(move || {
-                    readable
-                        && gh(&[
+                    crate::cache::inherit(cached, || {
+                        readable
+                            && gh(&[
                             "api",
                             "-H",
                             "Accept: application/vnd.github.raw",
                             &format!("repos/{slug}/contents/{path}"),
                         ])
                         .is_ok_and(|yaml| declares_dispatch(&yaml))
+                    })
                 })
             })
             .collect::<Vec<_>>();
@@ -1580,6 +1663,9 @@ mod tests {
             path: "a.rs".into(),
             line: Some(1),
             original_line: None,
+            side: None,
+            start_line: None,
+            start_side: None,
             created_at: at.into(),
         };
         let t = threads(vec![c(2, Some(1), "2026-01-02"), c(1, None, "2026-01-01"), c(3, None, "2026-01-03")]);

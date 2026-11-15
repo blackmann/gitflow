@@ -243,6 +243,7 @@ impl Workspace {
             .on_click(cx.listener(move |s, _, _, cx| {
                 if let Some(t) = s.current_mut() {
                     t.pr = Some(n);
+                    t.line_target = None;
                     t.pr_page = PrPage::Conversation;
                 }
                 cx.notify();
@@ -292,6 +293,7 @@ impl Workspace {
                     .on_click(cx.listener(|s, _, _, cx| {
                         if let Some(t) = s.current_mut() {
                             t.pr = None;
+                            t.line_target = None;
                         }
                         cx.notify();
                     })),
@@ -568,7 +570,20 @@ impl Workspace {
                                 .size_range(px(180.)..px(500.))
                                 .child(div().size_full().pt_1().border_r_1().border_color(rgb(colors.row_border)).child(self.diff_files(colors, &diff, t.diff_scroll.clone(), cx))),
                         )
-                        .child(resizable_panel().child(self.diff_list(("pr-diff", t.id), diff, t.diff_scroll.clone(), cx)))
+                        .child(
+                            resizable_panel().child(
+                                col()
+                                    .size_full()
+                                    .child(div().flex_1().min_h_0().child(self.diff_list(
+                                        ("pr-diff", t.id),
+                                        diff,
+                                        t.diff_scroll.clone(),
+                                        Some(super::diff::Review::new(&pr.threads, t.line_target.as_ref().map(|_| t.line_rows))),
+                                        cx,
+                                    )))
+                                    .when_some(t.line_target.clone(), |c, target| c.child(self.line_panel(n, pr, target, window, cx))),
+                            ),
+                        )
                         .into_any_element(),
                     (None, Some(e)) => failed(colors, &e).into_any_element(),
                     _ => loading(colors, "Loading diff…").into_any_element(),
@@ -583,6 +598,107 @@ impl Workspace {
             .child(sub)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// The comment box under a pull request diff: the line's existing threads,
+    /// then a composer that starts a thread or replies to the last one.
+    fn line_panel(&self, n: u64, pr: &gh::PullDetail, target: LineTarget, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let Some(t) = self.current() else { return div() };
+        let threads: Vec<&gh::Thread> = pr.threads.iter().filter(|th| super::diff::thread_target(th).as_ref() == Some(&target)).collect();
+        let side = if target.right { "" } else { " (removed)" };
+        let lines = match &t.line_start {
+            Some(start) if start.right == target.right => format!("{}–{}", start.line, target.line),
+            Some(start) => format!("{}{}–{}", start.line, if start.right { "" } else { " (removed)" }, target.line),
+            None => target.line.to_string(),
+        };
+        let header = row()
+            .gap_2()
+            .text_size(px(12.5))
+            .child(icon(Glyph::Message).size(px(14.)).text_color(rgb(colors.blue)))
+            .child(div().text_color(rgb(colors.muted)).child("Comment on"))
+            .child(tinted_chip(colors.text, colors.hover, mono, format!("{}:{lines}{side}", target.path.rsplit('/').next().unwrap_or(&target.path))).max_w(px(520.)))
+            .child(div().flex_1())
+            .child(icon_button("close-line-comment", IconName::Close, "Close").on_click(cx.listener(|s, _, _, cx| {
+                if let Some(t) = s.current_mut() {
+                    t.line_target = None;
+                }
+                cx.notify();
+            })));
+        let mut list = col().gap_3();
+        for (k, th) in threads.iter().enumerate() {
+            for (j, c) in std::iter::once(&th.root).chain(th.replies.iter()).enumerate() {
+                let at = util::parse_time(&c.created_at);
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .when(j > 0, |d| d.pl(px(28.)))
+                        .child(self.avatar(Some(&c.login()), &c.login(), 20., cx))
+                        .child(
+                            col()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(2.))
+                                .child(
+                                    row()
+                                        .gap(px(6.))
+                                        .text_size(px(12.5))
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(c.login()))
+                                        .child(div().text_color(rgb(colors.quiet)).child("•"))
+                                        .child(div().text_color(rgb(colors.muted)).child(stamp(at))),
+                                )
+                                .child(markdown(format!("pr-{n}-line-{k}-{j}-{}", c.id), &c.body, window, cx)),
+                        ),
+                );
+            }
+        }
+        let replying = !threads.is_empty();
+        col()
+            .flex_shrink_0()
+            .max_h(px(420.))
+            .gap_3()
+            .p_3()
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .child(header)
+            .when(replying, |c| {
+                c.child(
+                    div()
+                        .id(("line-threads", t.id))
+                        .flex_shrink()
+                        .min_h_0()
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .child(list),
+                )
+            })
+            .child(Input::new(&t.line_composer))
+            .child(
+                row()
+                    .gap_2()
+                    .child(label(colors, if replying { "Markdown · ⌘ Return to send" } else { "Markdown · ⌘ Return to send · ⇧-click a line for a range" }))
+                    .child(div().flex_1())
+                    .child(Button::new("cancel-line-comment").label("Cancel").ghost().small().on_click(cx.listener(|s, _, _, cx| {
+                        if let Some(t) = s.current_mut() {
+                            t.line_target = None;
+                        }
+                        cx.notify();
+                    })))
+                    .child(
+                        Button::new("send-line-comment")
+                            .label(if replying { "Reply" } else { "Comment" })
+                            .icon(Glyph::Message)
+                            .primary()
+                            .small()
+                            .loading(self.busy_with("Commenting"))
+                            .disabled(self.busy.is_some())
+                            .on_click(cx.listener(|s, _, w, cx| s.submit(&Submit, w, cx))),
+                    ),
+            )
     }
 
     /// A message's header and Markdown body; the avatar goes on the rail.
@@ -632,7 +748,11 @@ impl Workspace {
         let colors = palette(cx);
         let mono = settings::mono(cx);
         let root = &thread.root;
-        let line = root.line.or(root.original_line).map(|l| format!(":{l}")).unwrap_or_default();
+        let line = match (root.start_line, root.line.or(root.original_line)) {
+            (Some(a), Some(b)) if a != b => format!(":{a}–{b}"),
+            (_, Some(l)) => format!(":{l}"),
+            _ => String::new(),
+        };
         let verb = row()
             .gap(px(6.))
             .child(div().text_color(rgb(colors.muted)).child("commented on"))

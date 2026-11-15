@@ -392,6 +392,11 @@ impl Workspace {
                         Some(BlobView::Text(lines, _)) if md => markdown_doc(
                             format!("readme-{}-{}", t.repo, readme.path),
                             &lines.iter().map(|l| l.as_ref()).collect::<Vec<&str>>().join("\n"),
+                            self.repo(&t.repo).map(|r| super::md::Base {
+                                slug: r.slug(),
+                                reference: branch.to_string(),
+                                dir: readme.path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+                            }),
                             cx,
                         ),
                         Some(BlobView::Text(lines, _)) => div()
@@ -493,7 +498,13 @@ impl Workspace {
                                     .text_color(rgb(colors.quiet))
                                     .child((at + 1).to_string()),
                             )
-                            .child(div().pl_2().whitespace_nowrap().child(code))
+                            .child(
+                                div()
+                                    .pl_2()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(if dark { super::syntax::ONE_DARK_FG } else { super::syntax::ONE_LIGHT_FG }))
+                                    .child(code),
+                            )
                             .when_some(blamed, |r, c| {
                                 let sha = c.sha.clone();
                                 r.child(

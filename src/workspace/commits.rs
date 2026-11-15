@@ -439,7 +439,7 @@ impl Workspace {
                                     .child(div().flex_1().min_h_0().child(self.diff_files(colors, &diff, t.diff_scroll.clone(), cx))),
                             ),
                     )
-                    .child(resizable_panel().child(self.diff_list(("commit-diff", t.id), diff, t.diff_scroll.clone(), cx)))
+                    .child(resizable_panel().child(self.diff_list(("commit-diff", t.id), diff, t.diff_scroll.clone(), None, cx)))
                     .into_any_element()
             }
             (Some(Load { error: Some(e), .. }), _) => failed(colors, e).into_any_element(),

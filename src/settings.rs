@@ -136,7 +136,7 @@ pub fn support_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Gitflow"))
 }
 
-fn write(name: &str, bytes: Vec<u8>) -> Result<()> {
+pub fn write(name: &str, bytes: Vec<u8>) -> Result<()> {
     let dir = support_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(name), bytes)?;
