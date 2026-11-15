@@ -235,8 +235,6 @@ pub struct RepoInfo {
     pub is_archived: bool,
     #[serde(default)]
     pub pushed_at: Option<String>,
-    #[serde(default)]
-    pub ssh_url: String,
 }
 impl RepoInfo {
     pub fn default_branch(&self) -> String {
@@ -253,7 +251,7 @@ pub fn repo_info(slug: &str) -> Result<RepoInfo> {
         "view",
         slug,
         "--json",
-        "description,url,homepageUrl,stargazerCount,forkCount,watchers,issues,pullRequests,primaryLanguage,licenseInfo,defaultBranchRef,repositoryTopics,isPrivate,isFork,isArchived,pushedAt,sshUrl",
+        "description,url,homepageUrl,stargazerCount,forkCount,watchers,issues,pullRequests,primaryLanguage,licenseInfo,defaultBranchRef,repositoryTopics,isPrivate,isFork,isArchived,pushedAt",
     ])?)
 }
 
@@ -363,6 +361,172 @@ pub fn blob(slug: &str, path: &str, reference: &str) -> Result<Blob> {
         return Ok(Blob::Binary(b.size));
     }
     Ok(Blob::Text(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// A commit as the Code view shows it: headline, short hash and age.
+#[derive(Clone, Debug)]
+pub struct Brief {
+    pub sha: String,
+    pub message: String,
+    pub time: i64,
+}
+#[derive(Clone, Debug)]
+pub struct Head {
+    pub commit: Brief,
+    pub author: String,
+    pub login: Option<String>,
+    /// GitHub's combined check state for the commit, if any checks ran.
+    pub checks: Option<CheckState>,
+}
+#[derive(Clone, Debug)]
+pub struct FolderInfo {
+    pub head: Option<Head>,
+    /// Workflow runs for the head commit, newest first.
+    pub runs: Vec<Run>,
+    /// Each entry's last commit, by path.
+    pub files: std::collections::HashMap<String, Brief>,
+}
+const HISTORY_ALIASES: usize = 100;
+/// The branch head, its checks and runs, and the last commit touching each path,
+/// in one GraphQL query (one aliased `history` per path) plus one run listing.
+pub fn folder_info(slug: &str, branch: &str, paths: &[String]) -> Result<FolderInfo> {
+    let (owner, name) = slug.split_once('/').ok_or_else(|| anyhow!("Bad repository name"))?;
+    let mut fields = String::new();
+    for (i, p) in paths.iter().take(HISTORY_ALIASES).enumerate() {
+        // JSON string escaping is valid GraphQL string syntax.
+        let path = serde_json::to_string(p)?;
+        fields.push_str(&format!(
+            " f{i}: history(first: 1, path: {path}) {{ nodes {{ oid messageHeadline committedDate }} }}"
+        ));
+    }
+    let query = format!(
+        "query($owner: String!, $name: String!, $expr: String!) {{ repository(owner: $owner, name: $name) {{ object(expression: $expr) {{ ... on Commit {{ oid messageHeadline committedDate author {{ name user {{ login }} }} statusCheckRollup {{ state }}{fields} }} }} }} }}"
+    );
+    let text = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-f",
+        &format!("expr={branch}"),
+    ])?;
+    let v: serde_json::Value = json(&text)?;
+    let obj = &v["data"]["repository"]["object"];
+    let brief = |n: &serde_json::Value| -> Option<Brief> {
+        Some(Brief {
+            sha: n["oid"].as_str()?.to_string(),
+            message: n["messageHeadline"].as_str().unwrap_or("").to_string(),
+            time: crate::util::parse_time(n["committedDate"].as_str().unwrap_or("")),
+        })
+    };
+    let head = brief(obj).map(|commit| Head {
+        commit,
+        author: obj["author"]["name"].as_str().unwrap_or("").to_string(),
+        login: obj["author"]["user"]["login"].as_str().map(String::from),
+        checks: obj["statusCheckRollup"]["state"].as_str().map(|s| {
+            Check {
+                state: Some(s.to_string()),
+                ..Default::default()
+            }
+            .outcome()
+        }),
+    });
+    let mut files = std::collections::HashMap::new();
+    for (i, p) in paths.iter().take(HISTORY_ALIASES).enumerate() {
+        if let Some(b) = obj[format!("f{i}")]["nodes"].get(0).and_then(brief) {
+            files.insert(p.clone(), b);
+        }
+    }
+    // Runs are a nicety; a repository without Actions still shows its commits.
+    let runs = match &head {
+        Some(h) => gh(&[
+            "run",
+            "list",
+            "-R",
+            slug,
+            "--commit",
+            &h.commit.sha,
+            "-L",
+            "10",
+            "--json",
+            "databaseId,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt,updatedAt,startedAt,number,url",
+        ])
+        .ok()
+        .and_then(|t| json::<Vec<Run>>(&t).ok())
+        .unwrap_or_default(),
+        None => vec![],
+    };
+    Ok(FolderInfo { head, runs, files })
+}
+
+/// Who last changed each line of a file.
+#[derive(Clone, Debug)]
+pub struct BlameCommit {
+    pub sha: String,
+    pub message: String,
+    pub time: i64,
+    pub author: String,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Blame {
+    pub commits: Vec<BlameCommit>,
+    /// Per line (0-based), an index into `commits`.
+    pub lines: Vec<Option<usize>>,
+}
+impl Blame {
+    pub fn at(&self, line: usize) -> Option<&BlameCommit> {
+        self.lines.get(line).copied().flatten().and_then(|i| self.commits.get(i))
+    }
+}
+pub fn blame(slug: &str, branch: &str, path: &str) -> Result<Blame> {
+    let (owner, name) = slug.split_once('/').ok_or_else(|| anyhow!("Bad repository name"))?;
+    let query = "query($owner: String!, $name: String!, $expr: String!, $path: String!) { repository(owner: $owner, name: $name) { object(expression: $expr) { ... on Commit { blame(path: $path) { ranges { startingLine endingLine commit { oid messageHeadline committedDate author { name user { login } } } } } } } } }";
+    let text = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-f",
+        &format!("expr={branch}"),
+        "-f",
+        &format!("path={path}"),
+    ])?;
+    let v: serde_json::Value = json(&text)?;
+    let ranges = v["data"]["repository"]["object"]["blame"]["ranges"]
+        .as_array()
+        .ok_or_else(|| anyhow!("No blame for this file"))?;
+    let mut out = Blame::default();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in ranges {
+        let c = &r["commit"];
+        let Some(sha) = c["oid"].as_str() else { continue };
+        let i = *index.entry(sha.to_string()).or_insert_with(|| {
+            out.commits.push(BlameCommit {
+                sha: sha.to_string(),
+                message: c["messageHeadline"].as_str().unwrap_or("").to_string(),
+                time: crate::util::parse_time(c["committedDate"].as_str().unwrap_or("")),
+                author: c["author"]["name"].as_str().unwrap_or("").to_string(),
+            });
+            out.commits.len() - 1
+        });
+        let (from, to) = (r["startingLine"].as_u64().unwrap_or(0), r["endingLine"].as_u64().unwrap_or(0));
+        for line in from.max(1)..=to {
+            let at = line as usize - 1;
+            if out.lines.len() <= at {
+                out.lines.resize(at + 1, None);
+            }
+            out.lines[at] = Some(i);
+        }
+    }
+    Ok(out)
 }
 
 // ── Commits ──────────────────────────────────────────────────────────────────
@@ -478,6 +642,9 @@ struct ApiSignature {
 /// First-parent history of one branch from the REST API, for repositories without
 /// a local clone. Merge commits keep their second parents, so side lanes still show.
 pub fn remote_log(slug: &str, reference: &str, limit: u32) -> Result<Vec<Commit>> {
+    remote_commits(slug, reference, limit, "")
+}
+fn remote_commits(slug: &str, reference: &str, limit: u32, extra: &str) -> Result<Vec<Commit>> {
     let mut out = vec![];
     let mut page = 1;
     while (out.len() as u32) < limit {
@@ -485,7 +652,7 @@ pub fn remote_log(slug: &str, reference: &str, limit: u32) -> Result<Vec<Commit>
         let batch: Vec<ApiCommit> = json(&gh(&[
             "api",
             &format!(
-                "repos/{slug}/commits?sha={}&per_page={per}&page={page}",
+                "repos/{slug}/commits?sha={}&per_page={per}&page={page}{extra}",
                 encode(reference)
             ),
         ])?)?;
@@ -505,6 +672,52 @@ pub fn remote_log(slug: &str, reference: &str, limit: u32) -> Result<Vec<Commit>
         page += 1;
     }
     Ok(out)
+}
+
+pub const ACTIVITY_DAYS: usize = 30;
+/// Commits per local calendar day for the last 30 days (oldest first), newest
+/// commit first within a day.
+pub struct Activity {
+    pub days: Vec<(i64, Vec<Commit>)>,
+}
+pub fn activity(slug: &str, branch: &str) -> Result<Activity> {
+    use chrono::{Duration, Local, TimeZone};
+    let today = Local::now().date_naive();
+    let first = today - Duration::days(ACTIVITY_DAYS as i64 - 1);
+    let start = Local
+        .from_local_datetime(&first.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .ok_or_else(|| anyhow!("Bad local date"))?;
+    let since = start.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ");
+    let commits = remote_commits(slug, branch, 1000, &format!("&since={since}"))?;
+    let mut days = (0..ACTIVITY_DAYS)
+        .map(|i| {
+            let d = first + Duration::days(i as i64);
+            let ts = Local
+                .from_local_datetime(&d.and_hms_opt(12, 0, 0).unwrap())
+                .earliest()
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            (ts, vec![])
+        })
+        .collect::<Vec<(i64, Vec<Commit>)>>();
+    for c in commits {
+        let Some(t) = Local.timestamp_opt(c.time, 0).single() else { continue };
+        let i = (t.date_naive() - first).num_days();
+        if (0..ACTIVITY_DAYS as i64).contains(&i) {
+            days[i as usize].1.push(c);
+        }
+    }
+    Ok(Activity { days })
+}
+/// The URL a local clone fetches from: `origin`, else its first remote.
+pub fn origin_url(path: &Path) -> Result<String> {
+    if let Ok(url) = git(path, &["remote", "get-url", "origin"]) {
+        return Ok(url.trim().to_string());
+    }
+    let first = git(path, &["remote"])?;
+    let name = first.lines().next().ok_or_else(|| anyhow!("No remotes"))?.to_string();
+    Ok(git(path, &["remote", "get-url", &name])?.trim().to_string())
 }
 
 pub struct CommitDetail {
@@ -873,6 +1086,8 @@ pub struct PullDetail {
     #[serde(default)]
     pub merged_at: Option<String>,
     #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
     pub changed_files: u64,
     #[serde(default)]
     pub comments: Vec<Comment>,
@@ -884,9 +1099,59 @@ pub struct PullDetail {
     pub mergeable: String,
     #[serde(default)]
     pub merge_state_status: String,
+    /// Inline code-review comments, grouped into threads (filled separately).
+    #[serde(skip)]
+    pub threads: Vec<Thread>,
+}
+
+/// An inline code-review comment.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ReviewComment {
+    pub id: u64,
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+    #[serde(default)]
+    pub user: Option<Login>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub original_line: Option<u64>,
+    #[serde(default)]
+    pub created_at: String,
+}
+impl ReviewComment {
+    pub fn login(&self) -> String {
+        self.user.as_ref().map(|u| u.login.clone()).unwrap_or_default()
+    }
+}
+/// A review comment and its replies, oldest first.
+#[derive(Clone, Debug)]
+pub struct Thread {
+    pub root: ReviewComment,
+    pub replies: Vec<ReviewComment>,
+}
+/// Group review comments by the comment they reply to.
+pub fn threads(comments: Vec<ReviewComment>) -> Vec<Thread> {
+    let mut out: Vec<Thread> = vec![];
+    let mut sorted = comments;
+    sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    for c in sorted {
+        match c.in_reply_to_id.and_then(|parent| out.iter_mut().find(|t| t.root.id == parent)) {
+            Some(thread) => thread.replies.push(c),
+            None => out.push(Thread {
+                root: c,
+                replies: vec![],
+            }),
+        }
+    }
+    out
 }
 pub fn pull(slug: &str, number: u64) -> Result<PullDetail> {
-    json(&gh(&[
+    let mut detail: PullDetail = json(&gh(&[
         "pr",
         "view",
         &number.to_string(),
@@ -894,9 +1159,16 @@ pub fn pull(slug: &str, number: u64) -> Result<PullDetail> {
         slug,
         "--json",
         &format!(
-            "{PULL_FIELDS},body,url,mergedAt,changedFiles,comments,reviews,commits,mergeable,mergeStateStatus"
+            "{PULL_FIELDS},body,url,mergedAt,closedAt,changedFiles,comments,reviews,commits,mergeable,mergeStateStatus"
         ),
-    ])?)
+    ])?)?;
+    // Review threads are optional: a failure here still shows the conversation.
+    if let Ok(text) = gh(&["api", &format!("repos/{slug}/pulls/{number}/comments?per_page=100")])
+        && let Ok(comments) = json::<Vec<ReviewComment>>(&text)
+    {
+        detail.threads = threads(comments);
+    }
+    Ok(detail)
 }
 pub fn pull_diff(slug: &str, number: u64) -> Result<Vec<FileDiff>> {
     Ok(parse_diff(&gh(&[
@@ -1020,6 +1292,17 @@ pub fn runs(slug: &str, workflow: Option<u64>) -> Result<Vec<Run>> {
     json(&gh(&args)?)
 }
 
+/// How many recent runs are queued or in progress, for the sidebar indicator.
+pub fn active_runs(slug: &str) -> Result<usize> {
+    #[derive(Deserialize)]
+    struct Status {
+        #[serde(default)]
+        status: String,
+    }
+    let runs: Vec<Status> = json(&gh(&["run", "list", "-R", slug, "-L", "20", "--json", "status"])?)?;
+    Ok(runs.iter().filter(|r| !r.status.eq_ignore_ascii_case("completed")).count())
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Workflow {
     pub id: u64,
@@ -1028,11 +1311,51 @@ pub struct Workflow {
     pub state: String,
     #[serde(default)]
     pub path: String,
+    /// Declares a `workflow_dispatch` trigger, so it can be run by hand (filled separately).
+    #[serde(skip)]
+    pub dispatchable: bool,
 }
+/// Every workflow, with whether it can be started manually. GitHub only offers
+/// "Run workflow" for files on the default branch that declare
+/// `workflow_dispatch`, so each active file is read (in parallel) and checked.
 pub fn workflows(slug: &str) -> Result<Vec<Workflow>> {
-    json(&gh(&[
+    let mut list: Vec<Workflow> = json(&gh(&[
         "workflow", "list", "-R", slug, "--all", "-L", "100", "--json", "id,name,state,path",
-    ])?)
+    ])?)?;
+    std::thread::scope(|scope| {
+        let checks = list
+            .iter()
+            .map(|w| {
+                // Dynamic workflows (Dependabot, Pages, Copilot…) have no file to dispatch.
+                let readable = w.state == "active" && w.path.starts_with(".github/workflows/");
+                let path = w.path.clone();
+                scope.spawn(move || {
+                    readable
+                        && gh(&[
+                            "api",
+                            "-H",
+                            "Accept: application/vnd.github.raw",
+                            &format!("repos/{slug}/contents/{path}"),
+                        ])
+                        .is_ok_and(|yaml| declares_dispatch(&yaml))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (w, check) in list.iter_mut().zip(checks) {
+            w.dispatchable = check.join().unwrap_or(false);
+        }
+    });
+    Ok(list)
+}
+/// Whether a workflow file lists `workflow_dispatch` among its triggers, in any
+/// of YAML's forms (`on: workflow_dispatch`, a list, or a mapping key).
+/// Comments are ignored.
+pub fn declares_dispatch(yaml: &str) -> bool {
+    yaml.lines().any(|line| {
+        let code = line.split('#').next().unwrap_or("");
+        code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == "workflow_dispatch")
+    })
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1239,6 +1562,33 @@ mod tests {
         assert_eq!(files[2].path, "y");
     }
     #[test]
+    fn detects_manual_triggers() {
+        assert!(declares_dispatch("on:\n  push:\n  workflow_dispatch:\n    inputs: {}"));
+        assert!(declares_dispatch("on: [push, workflow_dispatch]"));
+        assert!(declares_dispatch("on: workflow_dispatch"));
+        assert!(!declares_dispatch("on:\n  push:\n  # workflow_dispatch:\n"));
+        assert!(!declares_dispatch("on: workflow_dispatched_elsewhere"));
+        assert!(!declares_dispatch("on: [push, pull_request]"));
+    }
+    #[test]
+    fn groups_review_threads() {
+        let c = |id: u64, reply: Option<u64>, at: &str| ReviewComment {
+            id,
+            in_reply_to_id: reply,
+            user: None,
+            body: String::new(),
+            path: "a.rs".into(),
+            line: Some(1),
+            original_line: None,
+            created_at: at.into(),
+        };
+        let t = threads(vec![c(2, Some(1), "2026-01-02"), c(1, None, "2026-01-01"), c(3, None, "2026-01-03")]);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].root.id, 1);
+        assert_eq!(t[0].replies.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
+        assert!(t[1].replies.is_empty());
+    }
+    #[test]
     fn rolls_up_checks() {
         let c = |status: &str, conclusion: &str| Check {
             status: Some(status.into()),
@@ -1279,6 +1629,14 @@ mod live {
         let root = tree(slug, "", &branch).unwrap();
         let readme = root.iter().find(|e| e.name.to_lowercase().starts_with("readme")).unwrap();
         assert!(matches!(blob(slug, &readme.path, &branch).unwrap(), Blob::Text(_)));
+        let b = blame(slug, &branch, &readme.path).unwrap();
+        assert!(b.at(0).is_some());
+        let paths = root.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+        let folder = folder_info(slug, &branch, &paths).unwrap();
+        assert!(folder.head.is_some());
+        assert!(folder.files.contains_key(&readme.path));
+        let act = activity(slug, &branch).unwrap();
+        assert_eq!(act.days.len(), ACTIVITY_DAYS);
         let log = remote_log(slug, &branch, 120).unwrap();
         assert_eq!(log.len(), 120);
         let detail = commit_detail(slug, None, &log[0].sha).unwrap();

@@ -23,7 +23,6 @@ pub enum Glyph {
     CircleDot,
     CircleDashed,
     CircleSlash,
-    Clock,
     FolderGit,
     Link,
     Scale,
@@ -64,7 +63,6 @@ impl Glyph {
             Self::CircleDot => "circle-dot.svg",
             Self::CircleDashed => "circle-dashed.svg",
             Self::CircleSlash => "circle-slash.svg",
-            Self::Clock => "clock.svg",
             Self::FolderGit => "folder-git.svg",
             Self::Link => "link.svg",
             Self::Scale => "scale.svg",
@@ -228,7 +226,7 @@ mod tests {
         for g in [
             Branch, Commit, PullRequest, PullRequestDraft, PullRequestClosed, Merge, Fork, Tag,
             Package, Code, History, Play, CirclePlay, Refresh, Message, CircleDot,
-            CircleDashed, CircleSlash, Clock, FolderGit, Link, Scale, RotateCcw, Stop, Download,
+            CircleDashed, CircleSlash, FolderGit, Link, Scale, RotateCcw, Stop, Download,
             Fetch, Terminal, FileDiff, ListChecks, Workflow, Lock, Compare, Graph,
             Activity,
         ] {

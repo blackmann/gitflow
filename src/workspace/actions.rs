@@ -17,6 +17,7 @@ use gpui_component::{
 };
 
 const LOG_ROW: f32 = 20.;
+const RUN_ROW: f32 = 60.;
 
 impl Workspace {
     pub(super) fn actions_view(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -47,7 +48,6 @@ impl Workspace {
 
     fn run_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let mono = settings::mono(cx);
         let Some(t) = self.current() else { return div().into_any_element() };
         let data = self.data(&t.repo);
         let workflows = data.and_then(|d| d.workflows.data.clone()).unwrap_or_default();
@@ -99,6 +99,10 @@ impl Workspace {
             },
             cx,
         );
+        // Only workflows with a workflow_dispatch trigger can be started by hand.
+        let runnable = data
+            .and_then(|d| d.workflows.data.as_ref())
+            .map(|list| list.iter().filter(|w| w.dispatchable).count());
         let dispatch = self.popover_button(
             "dispatch",
             Button::new("dispatch-trigger")
@@ -108,15 +112,23 @@ impl Workspace {
                 .small()
                 .dropdown_caret(true)
                 .loading(self.busy_with("Starting workflow"))
-                .disabled(self.busy.is_some()),
+                .disabled(self.busy.is_some() || runnable == Some(0))
+                .tooltip(match runnable {
+                    Some(0) => "No workflow here has a workflow_dispatch trigger",
+                    Some(_) => "Start a workflow that has a workflow_dispatch trigger",
+                    None => "Checking which workflows can be run…",
+                }),
             Some("Find a workflow…"),
             320.,
             |s, weak, _| {
                 let Some(t) = s.current() else { return vec![] };
                 let branch = s.branch_of(t).unwrap_or_default();
                 let mut out = vec![Entry::Label(format!("Run on {branch}").into())];
-                if let Some(list) = s.data(&t.repo).and_then(|d| d.workflows.data.as_ref()) {
-                    for wf in list.iter().filter(|w| w.state == "active") {
+                let Some(list) = s.data(&t.repo).and_then(|d| d.workflows.data.as_ref()) else {
+                    return vec![Entry::Item(Item::new("Checking workflows…").disabled(true))];
+                };
+                {
+                    for wf in list.iter().filter(|w| w.dispatchable) {
                         let (id, name, w) = (wf.id, wf.name.clone(), weak.clone());
                         out.push(Entry::Item(Item::new(wf.name.clone()).icon(Glyph::Workflow).detail(wf.path.rsplit('/').next().unwrap_or("").to_string()).on_click(
                             move |win, cx| {
@@ -140,7 +152,6 @@ impl Workspace {
             .border_color(rgb(colors.row_border))
             .child(filter)
             .when(t.view == View::Actions, |s| s.child(divider(colors)).child(self.branch_button("actions-branch", self.branch_of(t).unwrap_or_else(|| "…".into()), cx)))
-            .when(l.is_some_and(|l| l.loading && l.data.is_some()), |s| s.child(div().ml_2().child(spinner(colors))))
             .child(div().flex_1())
             .child(dispatch);
         let body = match state(colors, l, "Loading workflow runs…") {
@@ -150,62 +161,17 @@ impl Workspace {
                 if runs.is_empty() {
                     empty(colors, Glyph::CirclePlay, "No workflow runs", "Runs appear here once a workflow is triggered.").into_any_element()
                 } else {
-                    let mut list = col();
-                    for (i, r) in runs.iter().enumerate() {
-                        let id = r.database_id;
-                        let started = r.started_at.as_deref().or(Some(r.created_at.as_str()));
-                        let took = util::span(started, (!r.active()).then_some(r.updated_at.as_str()));
-                        list = list.child(
-                            row()
-                                .id(("run", id))
-                                .min_h(px(52.))
-                                .px_3()
-                                .py_2()
-                                .gap_3()
-                                .items_start()
-                                .cursor_pointer()
-                                .when(i > 0, |s| s.border_t_1().border_color(rgb(colors.row_border)))
-                                .hover(|s| s.bg(rgb(colors.hover)))
-                                .child(div().pt(px(2.)).child(run_icon(colors, &r.status, &r.conclusion)))
-                                .child(
-                                    col()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap(px(4.))
-                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(r.display_title.clone()))
-                                        .child(
-                                            row()
-                                                .gap(px(6.))
-                                                .text_size(px(12.))
-                                                .text_color(rgb(colors.muted))
-                                                .child(div().text_color(rgb(colors.text)).child(r.workflow_name.clone()))
-                                                .child(format!("#{}", r.number))
-                                                .child(div().text_color(rgb(colors.quiet)).child("·"))
-                                                .child(r.event.replace('_', " "))
-                                                .when(!r.head_branch.is_empty(), |s| s.child(chip(colors, mono.clone(), r.head_branch.clone()))),
-                                        ),
-                                )
-                                .child(
-                                    col()
-                                        .flex_shrink_0()
-                                        .items_end()
-                                        .gap(px(4.))
-                                        .text_size(px(12.))
-                                        .text_color(rgb(colors.muted))
-                                        .child(row().gap(px(5.)).child(icon(Glyph::Clock).size(px(12.))).child(self.when(util::parse_time(&r.created_at), cx)))
-                                        .when_some(took, |s, d| s.child(row().gap(px(5.)).child(icon(Glyph::History).size(px(12.))).child(d))),
-                                )
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    if let Some(t) = s.current_mut() {
-                                        t.run = Some(id);
-                                        t.job = None;
-                                        t.log_open = false;
-                                    }
-                                    cx.notify();
-                                })),
-                        );
-                    }
-                    div().id(("runs", t.id)).size_full().overflow_y_scroll().child(list).into_any_element()
+                    let runs = Arc::new(runs.clone());
+                    uniform_list(
+                        ("runs", t.id),
+                        runs.len(),
+                        cx.processor(move |s, range: std::ops::Range<usize>, _, cx| {
+                            range.map(|i| s.run_row(i, &runs, cx)).collect()
+                        }),
+                    )
+                    .track_scroll(t.list_scroll.clone())
+                    .size_full()
+                    .into_any_element()
                 }
             }
         };
@@ -215,6 +181,99 @@ impl Workspace {
             .child(header)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// One workflow run row; fixed height so the list can virtualize.
+    /// One run on the timeline: when it started, its status on the rail, and what
+    /// ran. Fixed height so the list can virtualize.
+    fn run_row(&self, i: usize, runs: &[gh::Run], cx: &mut Context<Self>) -> Stateful<Div> {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let r = &runs[i];
+        let id = r.database_id;
+        let default = self.current().and_then(|t| self.default_branch(&t.repo));
+        let tags = self
+            .current()
+            .and_then(|t| self.data(&t.repo)?.releases.data.as_ref());
+        let color = |r: &gh::Run| run_glyph(colors, &r.status, &r.conclusion).1;
+        let at = util::parse_time(&r.created_at);
+        let show_day = i == 0 || !same_day(util::parse_time(&runs[i - 1].created_at), at);
+        let started = r.started_at.as_deref().or(Some(r.created_at.as_str()));
+        let took = util::span(started, (!r.active()).then_some(r.updated_at.as_str()));
+        let dot = r
+            .status
+            .eq_ignore_ascii_case("in_progress")
+            .then(|| spinner(colors).into_any_element());
+        div()
+            .id(("run", id))
+            .flex()
+            .w_full()
+            .h(px(RUN_ROW))
+            .pl_2()
+            .pr_3()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(colors.hover)))
+            .child(date_column(colors, at, show_day, 12.))
+            .child(rail(
+                i.checked_sub(1).map(|p| color(&runs[p])),
+                color(r),
+                runs.get(i + 1).map(color),
+                14.,
+                dot,
+                colors.background,
+            ))
+            .child(
+                col()
+                    .flex_1()
+                    .min_w_0()
+                    .pt(px(11.))
+                    .gap(px(4.))
+                    .child(
+                        row()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(r.display_title.clone()))
+                            .when_some(took, |s, d| {
+                                s.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(colors.muted))
+                                        .child(d),
+                                )
+                            }),
+                    )
+                    .child(
+                        row()
+                            .gap(px(6.))
+                            .overflow_hidden()
+                            .text_size(px(12.))
+                            .text_color(rgb(colors.muted))
+                            .child(div().flex_shrink_0().child(r.workflow_name.clone()))
+                            .child(div().flex_shrink_0().font_family(mono.clone()).text_size(px(11.5)).child(format!("#{}", r.number)))
+                            .child(div().text_color(rgb(colors.quiet)).child("·"))
+                            .child(r.event.replace('_', " "))
+                            .when(!r.head_branch.is_empty(), |s| {
+                                // Merged branches are often deleted, so test for "not default, not a tag".
+                                let side = default.as_deref().is_some_and(|d| d != r.head_branch)
+                                    && !tags.as_ref().is_some_and(|t| t.iter().any(|t| t.tag_name == r.head_branch));
+                                let (fg, bg) = if side {
+                                    (colors.pink, colors.pink_tint)
+                                } else {
+                                    (colors.blue, colors.blue_tint)
+                                };
+                                s.child(tinted_chip(fg, bg, mono.clone(), r.head_branch.clone()))
+                            }),
+                    ),
+            )
+            .on_click(cx.listener(move |s, _, _, cx| {
+                if let Some(t) = s.current_mut() {
+                    t.run = Some(id);
+                    t.job = None;
+                    t.log_open = false;
+                }
+                cx.notify();
+            }))
     }
 
     fn run_page(&self, id: u64, cx: &mut Context<Self>) -> AnyElement {
@@ -252,7 +311,7 @@ impl Workspace {
                 Some(r) => format!("{} #{}", r.workflow_name, r.number),
                 None => format!("Run {id}"),
             }))
-            .when(jobs_l.is_some_and(|l| l.loading), |s| s.child(div().ml_2().child(spinner(colors))));
+;
         let busy = self.busy.is_some();
         let head = run.as_ref().map(|r| {
             let (glyph, color) = run_glyph(colors, &r.status, &r.conclusion);
@@ -496,6 +555,11 @@ impl Workspace {
             }),
         )
         .track_scroll(t.log_scroll.clone())
+        // Inside a horizontal scroller: keep sideways swipes from also scrolling rows.
+        .map(|mut list| {
+            list.style().restrict_scroll_to_axis = Some(true);
+            list
+        })
         .h_full()
         .min_w(px(1600.))
         .w_full();

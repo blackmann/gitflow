@@ -21,6 +21,8 @@ mod chrome;
 mod code;
 mod commits;
 mod diff;
+mod md;
+mod syntax;
 mod preferences;
 mod pulls;
 mod releases;
@@ -77,7 +79,8 @@ pub struct CommitGraph {
     pub graph: Graph,
 }
 pub enum BlobView {
-    Text(Vec<SharedString>),
+    /// Lines (tabs expanded) and their syntax highlighting, when the language is known.
+    Text(Vec<SharedString>, Option<Arc<syntax::Highlights>>),
     Binary(u64),
     TooLarge(u64),
 }
@@ -123,6 +126,10 @@ pub struct RepoData {
     pub info: Load<gh::RepoInfo>,
     pub branches: Load<Vec<gh::Branch>>,
     pub contributors: Load<Vec<gh::Contributor>>,
+    pub activity: Load<Arc<gh::Activity>>,
+    pub origin: Load<String>,
+    /// Queued or running workflow runs, polled for every repository.
+    pub running: Load<usize>,
     pub releases: Load<Vec<gh::Release>>,
     pub workflows: Load<Vec<gh::Workflow>>,
     pub runs: HashMap<Option<u64>, Load<Vec<gh::Run>>>,
@@ -132,7 +139,10 @@ pub struct RepoData {
     pub commits: HashMap<Option<String>, Load<Arc<CommitGraph>>>,
     pub commit: HashMap<String, Load<Arc<CommitInfo>>>,
     pub tree: HashMap<(String, String), Load<Vec<gh::Entry>>>,
+    /// Head commit, its runs, and each entry's last commit, per folder.
+    pub folder: HashMap<(String, String), Load<Arc<gh::FolderInfo>>>,
     pub blob: HashMap<(String, String), Load<Arc<BlobView>>>,
+    pub blame: HashMap<(String, String), Load<Arc<gh::Blame>>>,
     pub jobs: HashMap<u64, Load<Vec<gh::Job>>>,
     pub log: HashMap<u64, Load<Arc<LogView>>>,
 }
@@ -170,6 +180,7 @@ pub struct Tab {
     pub diff_scroll: UniformListScrollHandle,
     pub log_scroll: UniformListScrollHandle,
     pub page_scroll: ScrollHandle,
+    pub release_list: ListState,
 }
 
 struct Notice {
@@ -232,6 +243,12 @@ pub struct Workspace {
     brief_panels: Entity<ResizableState>,
     last_refresh: Instant,
     last_poll: Instant,
+    /// When every repository was last checked for running Actions; None polls now.
+    last_repo_poll: Option<Instant>,
+    /// The day hovered in the brief's activity strip.
+    activity_hover: Option<usize>,
+    /// The hovered line in the file viewer, for inline blame.
+    code_hover: Option<usize>,
     focus: FocusHandle,
 }
 
@@ -292,6 +309,9 @@ impl Workspace {
             brief_panels,
             last_refresh: Instant::now(),
             last_poll: Instant::now(),
+            last_repo_poll: None,
+            activity_hover: None,
+            code_hover: None,
             focus,
         };
         s.load_account(cx);
@@ -353,6 +373,7 @@ impl Workspace {
             diff_scroll: UniformListScrollHandle::new(),
             log_scroll: UniformListScrollHandle::new(),
             page_scroll: ScrollHandle::new(),
+            release_list: ListState::new(0, ListAlignment::Top, px(600.)),
         }
     }
     /// Focus the repository's existing tab, or open one on the default view.
@@ -499,6 +520,13 @@ impl Workspace {
         if self.brief {
             let s = slug.clone();
             self.fetch(&key, |d| &mut d.contributors, force, move || gh::contributors(&s), cx);
+            if let Some(branch) = self.default_branch(&key) {
+                let s = slug.clone();
+                self.fetch(&key, |d| &mut d.activity, force, move || Ok(Arc::new(gh::activity(&s, &branch)?)), cx);
+            }
+            if let Some(path) = repo.path.clone() {
+                self.fetch(&key, |d| &mut d.origin, false, move || gh::origin_url(&path), cx);
+            }
             let s = slug.clone();
             self.fetch(&key, |d| &mut d.releases, force, move || gh::releases(&s), cx);
             let s = slug.clone();
@@ -528,6 +556,23 @@ impl Workspace {
                     move || gh::tree(&s, &p, &b),
                     cx,
                 );
+                // Last commits need the folder's entries first.
+                let paths = self
+                    .data(&key)
+                    .and_then(|d| d.tree.get(&(branch.clone(), path.clone())))
+                    .and_then(|l| l.data.as_ref())
+                    .map(|entries| entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>());
+                if let Some(paths) = paths {
+                    let (s, b) = (slug.clone(), branch.clone());
+                    let k = (branch.clone(), path.clone());
+                    self.fetch(
+                        &key,
+                        move |d| d.folder.entry(k.clone()).or_default(),
+                        force,
+                        move || Ok(Arc::new(gh::folder_info(&s, &b, &paths)?)),
+                        cx,
+                    );
+                }
                 let readme = self
                     .data(&key)
                     .and_then(|d| d.tree.get(&(branch.clone(), path.clone())))
@@ -538,6 +583,17 @@ impl Workspace {
                             .find(|e| !e.is_dir() && e.name.to_lowercase().starts_with("readme"))
                             .map(|e| e.path.clone())
                     });
+                if let Some(file) = file.clone() {
+                    let (s, b, p) = (slug.clone(), branch.clone(), file.clone());
+                    let k = (branch.clone(), file);
+                    self.fetch(
+                        &key,
+                        move |d| d.blame.entry(k.clone()).or_default(),
+                        force,
+                        move || Ok(Arc::new(gh::blame(&s, &b, &p)?)),
+                        cx,
+                    );
+                }
                 for target in file.into_iter().chain(readme) {
                     let (s, b, p) = (slug.clone(), branch.clone(), target.clone());
                     let k = (branch.clone(), target);
@@ -625,6 +681,10 @@ impl Workspace {
                 let s = slug.clone();
                 self.fetch(&key, |d| &mut d.workflows, force, move || gh::workflows(&s), cx);
                 let s = slug.clone();
+                self.fetch(&key, |d| &mut d.branches, force, move || gh::branches(&s), cx);
+                let s = slug.clone();
+                self.fetch(&key, |d| &mut d.releases, force, move || gh::releases(&s), cx);
+                let s = slug.clone();
                 self.fetch(
                     &key,
                     move |d| d.runs.entry(workflow).or_default(),
@@ -672,10 +732,28 @@ impl Workspace {
             }
         }
         self.ensure(true, cx);
+        self.poll_repos(cx);
         if self.user.error.is_some() {
             self.load_account(cx);
         }
         cx.notify();
+    }
+    /// Check every repository for queued or running workflow runs.
+    fn poll_repos(&mut self, cx: &mut Context<Self>) {
+        self.last_repo_poll = Some(Instant::now());
+        for repo in self.repos.clone() {
+            let slug = repo.slug();
+            self.fetch(&repo.key(), |d| &mut d.running, true, move || gh::active_runs(&slug), cx);
+        }
+    }
+    /// Running workflow runs for the sidebar: the open tab's run list when it has
+    /// one (it is kept current), otherwise the background poll.
+    pub(super) fn running_runs(&self, key: &str) -> usize {
+        let Some(d) = self.data(key) else { return 0 };
+        match d.runs.get(&None).and_then(|l| l.data.as_ref()) {
+            Some(runs) => runs.iter().filter(|r| r.active()).count(),
+            None => d.running.data.unwrap_or(0),
+        }
     }
     /// Periodic work: repaint for avatars, auto-refresh, and poll running Actions.
     fn tick(&mut self, cx: &mut Context<Self>) {
@@ -685,8 +763,12 @@ impl Workspace {
         if self.prefs_open {
             return;
         }
-        let every = settings::get(cx).refresh_secs;
-        if every > 0 && self.last_refresh.elapsed() > Duration::from_secs(every as u64) {
+        let (on, every) = (settings::get(cx).auto_refresh, settings::get(cx).refresh_secs);
+        let interval = Duration::from_secs(every as u64);
+        if self.last_repo_poll.is_none() || (on && self.last_repo_poll.is_some_and(|t| t.elapsed() > interval)) {
+            self.poll_repos(cx);
+        }
+        if on && self.last_refresh.elapsed() > interval {
             self.last_refresh = Instant::now();
             self.ensure(true, cx);
             return;
@@ -932,7 +1014,8 @@ impl Workspace {
         });
         cx.notify();
     }
-    fn submit_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Add the typed repository; with `clone`, clone it locally first.
+    fn submit_url(&mut self, clone: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.url_input.read(cx).value().to_string();
         let Some((owner, name)) = gh::parse_slug(&text) else {
             self.notice = Notice::warn("Enter owner/name or a github.com URL.");
@@ -946,6 +1029,10 @@ impl Workspace {
             let _ = this.update_in(cx, |s, w, cx| {
                 s.adding = false;
                 match result {
+                    Ok((owner, name)) if clone => {
+                        s.add_url_open = false;
+                        s.clone_repo(owner, name, w, cx);
+                    }
                     Ok((owner, name)) => {
                         s.add_url_open = false;
                         s.add_repo(
@@ -953,6 +1040,71 @@ impl Workspace {
                                 owner,
                                 name,
                                 path: None,
+                            },
+                            w,
+                            cx,
+                        );
+                    }
+                    Err(e) => s.notice = Notice::warn(e.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    /// Ask for a parent folder, `gh repo clone` into `<folder>/<name>`, then add
+    /// (or upgrade) the repository as a local clone.
+    pub(super) fn clone_repo(&mut self, owner: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Clone Here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(parent) = paths.into_iter().next() else {
+                return;
+            };
+            let dest = parent.join(&name);
+            let slug = format!("{owner}/{name}");
+            let started = this
+                .update(cx, |s, cx| {
+                    if s.busy.is_some() {
+                        return false;
+                    }
+                    s.busy = Some(format!("Cloning {slug}"));
+                    s.notice = None;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !started {
+                return;
+            }
+            let target = dest.clone();
+            let result = smol::unblock(move || {
+                if target.exists() {
+                    anyhow::bail!("{} already exists. Pick another folder, or add it with Add local repository.", target.display());
+                }
+                gh::gh(&["repo", "clone", &slug, &target.to_string_lossy()])
+            })
+            .await;
+            let _ = this.update_in(cx, |s, w, cx| {
+                s.busy = None;
+                match result {
+                    Ok(_) => {
+                        s.notice = Notice::ok(format!("Cloned into {}", dest.display()));
+                        s.add_repo(
+                            Repo {
+                                owner,
+                                name,
+                                path: Some(dest),
                             },
                             w,
                             cx,
@@ -1086,7 +1238,7 @@ impl Workspace {
     }
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         if self.add_url_open {
-            self.submit_url(window, cx);
+            self.submit_url(false, window, cx);
             return;
         }
         let Some(t) = self.current() else { return };
@@ -1101,11 +1253,16 @@ impl Workspace {
 
 fn load_blob(slug: &str, path: &str, branch: &str) -> anyhow::Result<Arc<BlobView>> {
     Ok(Arc::new(match gh::blob(slug, path, branch)? {
-        gh::Blob::Text(t) => BlobView::Text(
-            t.lines()
+        gh::Blob::Text(t) => {
+            let lines = t
+                .lines()
                 .map(|l| SharedString::from(l.replace('\t', "    ")))
-                .collect(),
-        ),
+                .collect::<Vec<_>>();
+            let highlights = syntax::language(path)
+                .and_then(|lang| syntax::highlight(lang, &lines))
+                .map(Arc::new);
+            BlobView::Text(lines, highlights)
+        }
         gh::Blob::Binary(n) => BlobView::Binary(n),
         gh::Blob::TooLarge(n) => BlobView::TooLarge(n),
     }))

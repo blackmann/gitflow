@@ -9,9 +9,8 @@ use gpui_component::{
 };
 
 impl Workspace {
-    pub(super) fn releases_view(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn releases_view(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let mono = settings::mono(cx);
         let Some(t) = self.current() else { return div().into_any_element() };
         let Some(repo) = self.repo(&t.repo).cloned() else { return div().into_any_element() };
         let l = self.data(&t.repo).map(|d| &d.releases);
@@ -32,12 +31,33 @@ impl Workspace {
                 )
                 .into_any_element();
         }
+        // Only cards in view (plus overdraw) are laid out, Markdown included.
+        let state = t.release_list.clone();
+        if state.item_count() != releases.len() {
+            state.reset(releases.len());
+        }
+        list(
+            state,
+            cx.processor(|s, i: usize, window, cx| s.release_card(i, window, cx)),
+        )
+        .size_full()
+        .bg(rgb(colors.background))
+        .into_any_element()
+    }
+
+    fn release_card(&self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let Some(t) = self.current() else { return div().into_any_element() };
+        let Some(releases) = self.data(&t.repo).and_then(|d| d.releases.data.as_ref()) else {
+            return div().into_any_element();
+        };
+        let Some(r) = releases.get(i) else { return div().into_any_element() };
         let latest = releases
             .iter()
             .find(|r| !r.draft && !r.prerelease)
             .map(|r| r.tag_name.clone());
-        let mut timeline = col().gap_5();
-        for (i, r) in releases.iter().enumerate() {
+        {
             let is_latest = latest.as_ref() == Some(&r.tag_name);
             let author = r.author.as_ref().map(|a| a.login.clone()).unwrap_or_default();
             let url = r.html_url.clone();
@@ -50,17 +70,6 @@ impl Workspace {
                         .gap_3()
                         .border_b_1()
                         .border_color(rgb(colors.row_border))
-                        .child(
-                            div()
-                                .size(px(30.))
-                                .flex_shrink_0()
-                                .rounded(px(7.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(rgb(if is_latest { colors.green_tint } else { colors.hover }))
-                                .child(icon(Glyph::Tag).text_color(rgb(if is_latest { colors.green } else { colors.muted }))),
-                        )
                         .child(
                             col()
                                 .flex_1()
@@ -143,15 +152,39 @@ impl Workspace {
                 }
                 card = card.child(assets);
             }
-            timeline = timeline.child(card);
-        }
-        div()
-            .id(("releases", t.id))
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&t.page_scroll)
-            .bg(rgb(colors.background))
-            .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(timeline))
+            // Timeline: date, a rail fading between neighbouring release colors, the card.
+            let tone = |r: &gh::Release| {
+                if latest.as_ref() == Some(&r.tag_name) {
+                    colors.green
+                } else if r.draft {
+                    colors.quiet
+                } else if r.prerelease {
+                    colors.amber
+                } else {
+                    colors.blue
+                }
+            };
+            let top = if i == 0 { 16. } else { 0. };
+            let show_day = i == 0 || !same_day(releases[i - 1].time(), r.time());
+            div().w_full().px_4().child(
+                div()
+                    .flex()
+                    .max_w(px(1000.))
+                    .w_full()
+                    .mx_auto()
+                    .gap_2()
+                    .child(date_column(colors, r.time(), show_day, top + 16.))
+                    .child(rail(
+                        i.checked_sub(1).map(|p| tone(&releases[p])),
+                        tone(r),
+                        releases.get(i + 1).map(tone),
+                        top + 20.,
+                        None,
+                        colors.background,
+                    ))
+                    .child(div().flex_1().min_w_0().pt(px(top)).pb_5().child(card)),
+            )
             .into_any_element()
+        }
     }
 }

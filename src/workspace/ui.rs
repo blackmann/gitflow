@@ -1,5 +1,6 @@
 //! Small building blocks shared by every view, in CloudWatch v2's visual roles.
 use super::*;
+use gpui::prelude::FluentBuilder;
 use crate::{
     gh::CheckState,
     icons::Glyph,
@@ -11,7 +12,6 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     kbd::Kbd,
     spinner::Spinner,
-    text::TextView,
 };
 
 /// Shared layout rhythm: tab strip, nav bar and panel headers line up.
@@ -90,6 +90,9 @@ pub fn count_badge(colors: Palette, n: usize) -> Div {
 }
 /// A branch or ref name, in mono on a quiet chip.
 pub fn chip(colors: Palette, mono: SharedString, text: impl Into<SharedString>) -> Div {
+    tinted_chip(colors.blue, colors.blue_tint, mono, text)
+}
+pub fn tinted_chip(fg: u32, bg: u32, mono: SharedString, text: impl Into<SharedString>) -> Div {
     div()
         .flex_shrink_0()
         .max_w(px(260.))
@@ -98,8 +101,8 @@ pub fn chip(colors: Palette, mono: SharedString, text: impl Into<SharedString>) 
         .flex()
         .items_center()
         .rounded(px(4.))
-        .bg(rgb(colors.blue_tint))
-        .text_color(rgb(colors.blue))
+        .bg(rgb(bg))
+        .text_color(rgb(fg))
         .font_family(mono)
         .text_size(px(11.5))
         .truncate()
@@ -213,12 +216,23 @@ pub fn clean_markdown(text: &str) -> String {
     out.push_str(rest);
     out.trim().to_string()
 }
-pub fn markdown(id: impl Into<SharedString>, text: &str, window: &mut Window, cx: &mut App) -> AnyElement {
-    let text = clean_markdown(text);
-    TextView::markdown(ElementId::Name(id.into()), text, window, cx)
-        .selectable(true)
-        .text_size(px(13.))
-        .into_any_element()
+/// Markdown as GitHub shows comments and release notes: newlines are line breaks.
+pub fn markdown(id: impl Into<SharedString>, text: &str, _window: &mut Window, cx: &mut App) -> AnyElement {
+    render_md(id.into(), text, super::md::Breaks::Hard, cx)
+}
+/// Markdown as GitHub shows `.md` files: wrapped lines join into paragraphs.
+pub fn markdown_doc(id: impl Into<SharedString>, text: &str, cx: &mut App) -> AnyElement {
+    render_md(id.into(), text, super::md::Breaks::Soft, cx)
+}
+fn render_md(id: SharedString, text: &str, breaks: super::md::Breaks, cx: &App) -> AnyElement {
+    super::md::render(
+        id,
+        &clean_markdown(text),
+        breaks,
+        palette(cx),
+        settings::mono(cx),
+        px(settings::get(cx).mono_size as f32),
+    )
 }
 
 impl Workspace {
@@ -320,11 +334,126 @@ pub fn card(colors: Palette) -> Div {
         .bg(rgb(colors.background))
         .overflow_hidden()
 }
+// ── Timeline ─────────────────────────────────────────────────────────────────
+
+pub const RAIL: f32 = 28.;
+pub const DATE_COL: f32 = 92.;
+const DOT: f32 = 10.;
+
+/// Blend two RGB colors; `t` = 0 gives `a`, 1 gives `b`.
+pub fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |c: u32, s: u32| ((c >> s) & 0xff) as f32;
+    let blend = |s: u32| ((ch(a, s) + (ch(b, s) - ch(a, s)) * t).round().clamp(0., 255.) as u32) << s;
+    blend(16) | blend(8) | blend(0)
+}
+
+/// A vertical stretch of rail fading from one color into another.
+fn rail_piece(from: u32, to: u32) -> Div {
+    div()
+        .w(px(2.))
+        .bg(linear_gradient(180., linear_color_stop(rgb(from), 0.), linear_color_stop(rgb(to), 1.)))
+}
+
+/// The middle column of a timeline row. The rail runs unbroken through the dot's
+/// centre and the dot is drawn over it, so line and dot always join. Rails meet
+/// neighbouring rows halfway between the two status colors, so the line reads as
+/// one gradient from each item's color to the next. `dot` replaces the plain dot
+/// (e.g. a spinner); it sits on a disc of `surface` so the rail doesn't show through.
+pub fn rail(
+    prev: Option<u32>,
+    color: u32,
+    next: Option<u32>,
+    dot_top: f32,
+    dot: Option<AnyElement>,
+    surface: u32,
+) -> Div {
+    const SLOT: f32 = 14.;
+    let centre = dot_top + SLOT / 2.;
+    let marker = match dot {
+        Some(custom) => div()
+            .absolute()
+            .top(px(dot_top))
+            .left(px((RAIL - SLOT) / 2.))
+            .size(px(SLOT))
+            .rounded_full()
+            .bg(rgb(surface))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(custom),
+        None => div()
+            .absolute()
+            .top(px(centre - DOT / 2.))
+            .left(px((RAIL - DOT) / 2.))
+            .size(px(DOT))
+            .rounded_full()
+            .bg(rgb(color)),
+    };
+    col()
+        .relative()
+        .w(px(RAIL))
+        .flex_shrink_0()
+        .items_center()
+        .child(match prev {
+            Some(p) => rail_piece(mix(p, color, 0.5), color).h(px(centre)),
+            None => div().h(px(centre)),
+        })
+        .child(match next {
+            Some(n) => rail_piece(color, mix(color, n, 0.5)).flex_1(),
+            None => div().flex_1(),
+        })
+        .child(marker)
+}
+
+/// "Today", "Yesterday", "Nov 14" or "Nov 14, 2024" in local time.
+pub fn day(ts: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let (Some(t), Some(n)) = (Local.timestamp_opt(ts, 0).single(), Local.timestamp_opt(util::now(), 0).single()) else {
+        return String::new();
+    };
+    let days = (n.date_naive() - t.date_naive()).num_days();
+    match days {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        _ if t.year() == n.year() => t.format("%b %-d").to_string(),
+        _ => t.format("%b %-d, %Y").to_string(),
+    }
+}
+pub fn clock(ts: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|t| t.format("%-I:%M %p").to_string())
+        .unwrap_or_default()
+}
+/// The left column: the day (only where it changes) above the time.
+pub fn date_column(colors: Palette, ts: i64, show_day: bool, top: f32) -> Div {
+    col()
+        .w(px(DATE_COL))
+        .flex_shrink_0()
+        .items_end()
+        .pt(px(top))
+        .pr_1()
+        .gap(px(1.))
+        .when(show_day, |s| s.child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).child(day(ts))))
+        .child(div().text_size(px(11.5)).text_color(rgb(colors.muted)).child(clock(ts)))
+}
+pub fn same_day(a: i64, b: i64) -> bool {
+    day(a) == day(b)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn strips_template_comments() {
         assert_eq!(super::clean_markdown("a<!-- hidden -->b\n<!-- x"), "ab");
         assert_eq!(super::clean_markdown("plain"), "plain");
+    }
+    #[test]
+    fn mixes_colors() {
+        assert_eq!(super::mix(0x000000, 0xffffff, 0.5), 0x808080);
+        assert_eq!(super::mix(0xff0000, 0x0000ff, 0.), 0xff0000);
+        assert_eq!(super::mix(0xff0000, 0x0000ff, 1.), 0x0000ff);
     }
 }

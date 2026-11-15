@@ -7,8 +7,14 @@ use std::path::PathBuf;
 
 pub const MONO_SIZES: std::ops::RangeInclusive<u32> = 10..=18;
 pub const COMMIT_LIMITS: &[u32] = &[100, 250, 500, 1000, 2000];
-pub const REFRESH_CHOICES: &[(u32, &str)] =
-    &[(0, "Off"), (30, "30 seconds"), (60, "1 minute"), (300, "5 minutes")];
+pub const REFRESH_CHOICES: &[(u32, &str)] = &[
+    (15, "15 seconds"),
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (120, "2 minutes"),
+    (300, "5 minutes"),
+    (600, "10 minutes"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemePref {
@@ -88,7 +94,9 @@ pub struct Settings {
     pub default_view: View,
     /// How many commits the graph loads.
     pub commit_limit: u32,
-    /// Refresh the visible view this often, in seconds; 0 turns it off.
+    /// Re-read the visible view (and poll each repository's running Actions).
+    pub auto_refresh: bool,
+    /// How often auto-refresh runs, in seconds.
     pub refresh_secs: u32,
     pub merge_method: MergeMethod,
     pub delete_branch: bool,
@@ -107,6 +115,7 @@ impl Default for Settings {
             mono_size: 12,
             default_view: View::Code,
             commit_limit: 500,
+            auto_refresh: true,
             refresh_secs: 60,
             merge_method: MergeMethod::Squash,
             delete_branch: true,
@@ -150,6 +159,14 @@ impl Settings {
         self.mono_size = self.mono_size.clamp(*MONO_SIZES.start(), *MONO_SIZES.end());
         if self.mono_font.trim().is_empty() {
             self.mono_font = Self::default().mono_font;
+        }
+        // Older settings used 0 seconds for "off".
+        if self.refresh_secs == 0 {
+            self.auto_refresh = false;
+            self.refresh_secs = 60;
+        }
+        if !REFRESH_CHOICES.iter().any(|(s, _)| *s == self.refresh_secs) {
+            self.refresh_secs = 60;
         }
         if !COMMIT_LIMITS.contains(&self.commit_limit) {
             self.commit_limit = Self::default().commit_limit;
@@ -237,6 +254,10 @@ mod tests {
         assert_eq!(s.commit_limit, 500);
         assert_eq!(s.mono_font, "Menlo");
         assert_eq!(s.merge_method, MergeMethod::Squash);
+        let old: Settings = serde_json::from_str(r#"{"refresh_secs": 0}"#).unwrap();
+        let old = old.sanitized();
+        assert!(!old.auto_refresh);
+        assert_eq!(old.refresh_secs, 60);
     }
     #[test]
     fn repo_keys_ignore_case() {

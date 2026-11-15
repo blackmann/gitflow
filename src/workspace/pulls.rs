@@ -19,6 +19,22 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
+const PR_ROW: f32 = 56.;
+/// Conversation layout: avatar column, gap to the text, reply geometry.
+const AVATAR: f32 = 34.;
+const RAIL_INSET: f32 = AVATAR + 12.;
+const REPLY_AVATAR: f32 = 24.;
+const REPLY_TOP: f32 = 14.;
+
+/// The conversation rail: visible on both themes without competing with text.
+fn rail_color(colors: Palette) -> u32 {
+    mix(colors.border, colors.quiet, 0.45)
+}
+/// "Nov 11 at 10:43 AM", or "Today at …" / "Yesterday at …".
+fn stamp(ts: i64) -> String {
+    format!("{} at {}", day(ts), clock(ts))
+}
+
 pub(super) fn segmented<T: Copy + PartialEq + 'static>(
     colors: Palette,
     id: &'static str,
@@ -103,7 +119,6 @@ impl Workspace {
                         .cleanable(true),
                 ),
             )
-            .when(l.is_some_and(|l| l.loading && l.data.is_some()), |s| s.child(spinner(colors)))
             .child(div().flex_1())
             .child(
                 Button::new("new-pr")
@@ -137,82 +152,17 @@ impl Workspace {
                     )
                     .into_any_element()
                 } else {
-                    let mono = settings::mono(cx);
-                    let mut list = col();
-                    for (i, p) in shown.into_iter().enumerate() {
-                        let (glyph, color, _, _) = pr_glyph(colors, &p.state, p.is_draft);
-                        let n = p.number;
-                        let checks = gh::rollup(&p.status_check_rollup);
-                        let review = p.review_decision.as_deref().unwrap_or("");
-                        let tip = format!("{} → {}", p.head_ref_name, p.base_ref_name);
-                        list = list.child(
-                            row()
-                                .id(("pr", n))
-                                .min_h(px(54.))
-                                .px_3()
-                                .py_2()
-                                .gap_3()
-                                .items_start()
-                                .cursor_pointer()
-                                .when(i > 0, |s| s.border_t_1().border_color(rgb(colors.row_border)))
-                                .hover(|s| s.bg(rgb(colors.hover)))
-                                .child(div().pt(px(2.)).child(icon(glyph).size(px(16.)).text_color(rgb(color))))
-                                .child(
-                                    col()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap(px(4.))
-                                        .child(
-                                            row()
-                                                .gap(px(6.))
-                                                .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(p.title.clone()))
-                                                .children(p.labels.iter().take(3).map(|l| label_pill(colors, l))),
-                                        )
-                                        .child(
-                                            row()
-                                                .gap(px(6.))
-                                                .text_size(px(12.))
-                                                .text_color(rgb(colors.muted))
-                                                .child(format!("#{n}"))
-                                                .child(format!("opened {} by {}", self.when(util::parse_time(&p.created_at), cx), p.author.login))
-                                                .child(div().text_color(rgb(colors.quiet)).child("·"))
-                                                .child(
-                                                    div()
-                                                        .id(("pr-branch", n))
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .font_family(mono.clone())
-                                                        .text_size(px(11.5))
-                                                        .child(p.head_ref_name.clone())
-                                                        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx)),
-                                                ),
-                                        ),
-                                )
-                                .child(
-                                    row()
-                                        .flex_shrink_0()
-                                        .gap_3()
-                                        .pt(px(2.))
-                                        .when_some(review_pill(colors, review), |s, p| s.child(p))
-                                        .when_some(checks, |s, c| s.child(check_icon(colors, c)))
-                                        .child(super::diff::counts(colors, p.additions as u32, p.deletions as u32))
-                                        .child(self.avatar(Some(&p.author.login), &p.author.login, 20., cx)),
-                                )
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    if let Some(t) = s.current_mut() {
-                                        t.pr = Some(n);
-                                        t.pr_page = PrPage::Conversation;
-                                    }
-                                    cx.notify();
-                                })),
-                        );
-                    }
-                    div()
-                        .id(("pr-list", t.id))
-                        .size_full()
-                        .overflow_y_scroll()
-                        .child(list)
-                        .into_any_element()
+                    let shown = Arc::new(shown.into_iter().cloned().collect::<Vec<_>>());
+                    uniform_list(
+                        ("pr-list", t.id),
+                        shown.len(),
+                        cx.processor(move |s, range: std::ops::Range<usize>, _, cx| {
+                            range.map(|i| s.pr_row(i, &shown[i], cx)).collect()
+                        }),
+                    )
+                    .track_scroll(t.list_scroll.clone())
+                    .size_full()
+                    .into_any_element()
                 }
             }
         };
@@ -222,6 +172,81 @@ impl Workspace {
             .child(header)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+
+    /// One pull request row; fixed height so the list can virtualize.
+    fn pr_row(&self, i: usize, p: &gh::Pull, cx: &mut Context<Self>) -> Stateful<Div> {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let (glyph, color, _, _) = pr_glyph(colors, &p.state, p.is_draft);
+        let n = p.number;
+        let checks = gh::rollup(&p.status_check_rollup);
+        let review = p.review_decision.as_deref().unwrap_or("");
+        let tip = format!("{} → {}", p.head_ref_name, p.base_ref_name);
+        row()
+            .id(("pr", n))
+            .w_full()
+            .h(px(PR_ROW))
+            .px_3()
+            .py_2()
+            .gap_3()
+            .items_start()
+            .cursor_pointer()
+            .when(i > 0, |s| s.border_t_1().border_color(rgb(colors.row_border)))
+            .hover(|s| s.bg(rgb(colors.hover)))
+            .child(div().pt(px(2.)).child(icon(glyph).size(px(16.)).text_color(rgb(color))))
+            .child(
+                col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .child(
+                        row()
+                            .w_full()
+                            .gap(px(6.))
+                            .overflow_hidden()
+                            .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(p.title.clone()))
+                            .children(p.labels.iter().take(3).map(|l| label_pill(colors, l))),
+                    )
+                    .child(
+                        row()
+                            .w_full()
+                            .gap(px(6.))
+                            .overflow_hidden()
+                            .text_size(px(12.))
+                            .text_color(rgb(colors.muted))
+                            .child(format!("#{n}"))
+                            .child(format!("opened {} by {}", self.when(util::parse_time(&p.created_at), cx), p.author.login))
+                            .child(div().text_color(rgb(colors.quiet)).child("·"))
+                            .child(
+                                div()
+                                    .id(("pr-branch", n))
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(mono.clone())
+                                    .text_size(px(11.5))
+                                    .child(p.head_ref_name.clone())
+                                    .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx)),
+                            ),
+                    ),
+            )
+            .child(
+                row()
+                    .flex_shrink_0()
+                    .gap_3()
+                    .pt(px(2.))
+                    .when_some(review_pill(colors, review), |s, p| s.child(p))
+                    .when_some(checks, |s, c| s.child(check_icon(colors, c)))
+                    .child(super::diff::counts(colors, p.additions as u32, p.deletions as u32))
+                    .child(self.avatar(Some(&p.author.login), &p.author.login, 20., cx)),
+            )
+            .on_click(cx.listener(move |s, _, _, cx| {
+                if let Some(t) = s.current_mut() {
+                    t.pr = Some(n);
+                    t.pr_page = PrPage::Conversation;
+                }
+                cx.notify();
+            }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -273,7 +298,7 @@ impl Workspace {
             )
             .child(div().text_color(rgb(colors.quiet)).child("/"))
             .child(div().text_color(rgb(colors.muted)).child(format!("#{n}")))
-            .when(l.is_some_and(|l| l.loading), |s| s.child(div().ml_2().child(spinner(colors))));
+;
         let Some(pr) = l.and_then(|l| l.data.as_ref()) else {
             let body = match l.and_then(|l| l.error.clone()) {
                 Some(e) => failed(colors, &e),
@@ -483,15 +508,33 @@ impl Workspace {
                     )
                     .child(self.avatar(Some(&p.author.login), &p.author.login, 18., cx))
                     .child(div().text_color(rgb(colors.text)).child(p.author.login.clone()))
-                    .child(if pr.merged_at.is_some() { "merged" } else { "wants to merge" })
+                    .child(match p.state.as_str() {
+                        "MERGED" => "merged",
+                        "CLOSED" => "wanted to merge",
+                        _ => "wants to merge",
+                    })
                     .child(format!("{} commit{} into", pr.commits.len(), if pr.commits.len() == 1 { "" } else { "s" }))
                     .child(chip(colors, mono.clone(), p.base_ref_name.clone()))
                     .child("from")
-                    .child(chip(colors, mono.clone(), p.head_ref_name.clone())),
+                    .child(chip(colors, mono.clone(), p.head_ref_name.clone()))
+                    .map(|s| {
+                        // When it ended, or when it was opened while still open.
+                        let (what, at) = match p.state.as_str() {
+                            "MERGED" => ("merged", pr.merged_at.as_deref()),
+                            "CLOSED" => ("closed", pr.closed_at.as_deref()),
+                            _ => ("opened", Some(p.created_at.as_str())),
+                        };
+                        match at.map(util::parse_time).filter(|t| *t > 0) {
+                            Some(at) => s
+                                .child(div().text_color(rgb(colors.quiet)).child("•"))
+                                .child(format!("{what} {}", stamp(at))),
+                            None => s,
+                        }
+                    }),
             );
         let rollup = gh::rollup(&p.status_check_rollup);
         let tabs = [
-            (PrPage::Conversation, format!("Conversation  {}", pr.comments.len() + pr.reviews.iter().filter(|r| !r.body.is_empty()).count())),
+            (PrPage::Conversation, format!("Conversation  {}", pr.comments.len() + pr.reviews.iter().filter(|r| !r.body.is_empty()).count() + pr.threads.iter().map(|t| 1 + t.replies.len()).sum::<usize>())),
             (PrPage::Commits, format!("Commits  {}", pr.commits.len())),
             (PrPage::Checks, format!("Checks  {}", p.status_check_rollup.len())),
             (PrPage::Files, format!("Files changed  {}", pr.changed_files)),
@@ -542,43 +585,143 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A message's header and Markdown body; the avatar goes on the rail.
     #[allow(clippy::too_many_arguments)]
-    fn comment_card(&self, id: String, login: &str, verb: String, when: i64, body: &str, accent: Option<(u32, u32, &'static str)>, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn message(&self, id: String, login: &str, verb: Option<Div>, when: i64, body: &str, accent: Option<(u32, u32, &'static str)>, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
-        row()
-            .items_start()
-            .gap_3()
-            .child(self.avatar(Some(login), login, 28., cx))
+        col()
+            .gap(px(6.))
             .child(
-                card(colors)
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        row()
-                            .h(px(34.))
-                            .px_3()
-                            .gap_2()
-                            .bg(rgb(colors.chrome))
-                            .border_b_1()
-                            .border_color(rgb(colors.row_border))
-                            .text_size(px(12.5))
-                            .child(div().font_weight(FontWeight::MEDIUM).child(login.to_string()))
-                            .child(div().text_color(rgb(colors.muted)).child(format!("{verb} {}", self.when(when, cx))))
-                            .when_some(accent, |s, (fg, bg, text)| s.child(pill(text, fg, bg))),
-                    )
-                    .when(!body.trim().is_empty(), |s| s.child(div().px_4().py_3().child(markdown(id, body, window, cx))))
-                    .when(body.trim().is_empty(), |s| s.child(div().px_4().py_3().text_color(rgb(colors.muted)).child("No description provided."))),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(13.))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(login.to_string()))
+                    .children(verb)
+                    .child(div().text_color(rgb(colors.quiet)).child("•"))
+                    .child(div().text_color(rgb(colors.muted)).child(stamp(when)))
+                    .when_some(accent, |s, (fg, bg, text)| s.child(pill(text, fg, bg))),
             )
+            .child(if body.trim().is_empty() {
+                div().text_color(rgb(colors.muted)).child("No description provided.").into_any_element()
+            } else {
+                markdown(id, body, window, cx)
+            })
+    }
+    /// A round badge holding an event's glyph, in the avatar column.
+    fn badge(&self, glyph: impl Into<gpui_component::Icon>, color: u32, cx: &App) -> AnyElement {
+        let colors = palette(cx);
+        div()
+            .size(px(AVATAR))
+            .flex_shrink_0()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(colors.chrome))
+            .border_1()
+            .border_color(rgb(colors.row_border))
+            .child(icon(glyph).size(px(15.)).text_color(rgb(color)))
+            .into_any_element()
+    }
+    /// An inline review comment with its replies. Each reply branches off the
+    /// rail on a curve, so the thread reads as one conversation.
+    fn review_thread(&self, n: u64, k: usize, thread: &gh::Thread, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let root = &thread.root;
+        let line = root.line.or(root.original_line).map(|l| format!(":{l}")).unwrap_or_default();
+        let verb = row()
+            .gap(px(6.))
+            .child(div().text_color(rgb(colors.muted)).child("commented on"))
+            .child(tinted_chip(colors.text, colors.hover, mono, format!("{}{line}", root.path)));
+        let mut out = self.message(
+            format!("pr-{n}-t{k}"),
+            &root.login(),
+            Some(verb),
+            util::parse_time(&root.created_at),
+            &root.body,
+            None,
+            window,
+            cx,
+        );
+        let rail = rail_color(colors);
+        for (j, reply) in thread.replies.iter().enumerate() {
+            // From the rail (centre of the avatar column) down and round into the
+            // reply's avatar. Painted outside the reply's own box, to its left.
+            let bend = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let o = bounds.origin;
+                    let cy = o.y + px(REPLY_TOP + REPLY_AVATAR / 2.);
+                    let end = o.x + bounds.size.width;
+                    let mut b = PathBuilder::stroke(px(2.));
+                    b.move_to(point(o.x, cy - px(14.)));
+                    b.curve_to(point(o.x + px(12.), cy), point(o.x, cy));
+                    b.line_to(point(end, cy));
+                    if let Ok(path) = b.build() {
+                        window.paint_path(path, rgb(rail));
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left(px(-(RAIL_INSET - AVATAR / 2.)))
+            .w(px(RAIL_INSET - AVATAR / 2. - 4.))
+            .h(px(REPLY_TOP + REPLY_AVATAR));
+            let at = util::parse_time(&reply.created_at);
+            out = out.child(
+                div()
+                    .relative()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .pt(px(REPLY_TOP))
+                    .child(bend)
+                    .child(self.avatar(Some(&reply.login()), &reply.login(), REPLY_AVATAR, cx))
+                    .child(
+                        col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(4.))
+                            .child(
+                                row()
+                                    .gap(px(6.))
+                                    .text_size(px(12.5))
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(reply.login()))
+                                    .child(div().text_color(rgb(colors.quiet)).child("•"))
+                                    .child(div().text_color(rgb(colors.muted)).child(stamp(at))),
+                            )
+                            .child(markdown(format!("pr-{n}-t{k}-r{j}"), &reply.body, window, cx)),
+                    ),
+            );
+        }
+        out
     }
 
     fn conversation(&self, pr: &gh::PullDetail, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let Some(t) = self.current() else { return div().into_any_element() };
         let n = pr.summary.number;
-        let mut items: Vec<(i64, Div)> = vec![];
+        let p = &pr.summary;
+        // Everything on the rail, oldest first: (time, avatar or badge, content).
+        let mut items: Vec<(i64, AnyElement, Div)> = vec![];
+        let opened = util::parse_time(&p.created_at);
+        let verb = |text: &str| div().text_color(rgb(colors.muted)).child(text.to_string());
+        items.push((
+            opened,
+            self.avatar(Some(&p.author.login), &p.author.login, AVATAR, cx),
+            self.message(format!("pr-{n}-body"), &p.author.login, Some(verb("opened this")), opened, &pr.body, None, window, cx),
+        ));
         for (i, c) in pr.comments.iter().enumerate() {
             let at = util::parse_time(&c.created_at);
-            items.push((at, self.comment_card(format!("pr-{n}-c{i}"), &c.author.login, "commented".into(), at, &c.body, None, window, cx)));
+            items.push((
+                at,
+                self.avatar(Some(&c.author.login), &c.author.login, AVATAR, cx),
+                self.message(format!("pr-{n}-c{i}"), &c.author.login, None, at, &c.body, None, window, cx),
+            ));
         }
         for (i, r) in pr.reviews.iter().enumerate() {
             let at = util::parse_time(r.submitted_at.as_deref().unwrap_or(""));
@@ -591,41 +734,50 @@ impl Workspace {
             if r.body.trim().is_empty() {
                 // A bare approval reads as a one-line event.
                 let Some((fg, _, text)) = accent else { continue };
+                let glyph = if r.state == "APPROVED" { IconName::CircleCheck } else { IconName::TriangleAlert };
+                let line = row()
+                    .min_h(px(AVATAR))
+                    .gap(px(6.))
+                    .text_size(px(13.))
+                    .child(self.avatar(Some(&r.author.login), &r.author.login, 18., cx))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(r.author.login.clone()))
+                    .child(div().text_color(rgb(fg)).child(match r.state.as_str() {
+                        "APPROVED" => "approved these changes".to_string(),
+                        "CHANGES_REQUESTED" => "requested changes".to_string(),
+                        _ => text.to_lowercase(),
+                    }))
+                    .child(div().text_color(rgb(colors.quiet)).child("•"))
+                    .child(div().text_color(rgb(colors.muted)).child(stamp(at)));
+                items.push((at, self.badge(glyph, fg, cx), line));
+            } else {
                 items.push((
                     at,
-                    row()
-                        .gap_3()
-                        .pl(px(6.))
-                        .text_size(px(12.5))
-                        .text_color(rgb(colors.muted))
-                        .child(icon(if r.state == "APPROVED" { IconName::CircleCheck } else { IconName::TriangleAlert }).text_color(rgb(fg)))
-                        .child(self.avatar(Some(&r.author.login), &r.author.login, 16., cx))
-                        .child(div().text_color(rgb(colors.text)).child(r.author.login.clone()))
-                        .child(format!("{} {}", text.to_lowercase(), self.when(at, cx))),
+                    self.avatar(Some(&r.author.login), &r.author.login, AVATAR, cx),
+                    self.message(format!("pr-{n}-r{i}"), &r.author.login, Some(verb("reviewed")), at, &r.body, accent, window, cx),
                 ));
-            } else {
-                items.push((at, self.comment_card(format!("pr-{n}-r{i}"), &r.author.login, "reviewed".into(), at, &r.body, accent, window, cx)));
             }
         }
-        items.sort_by_key(|(at, _)| *at);
-        let p = &pr.summary;
-        let mut thread = col().gap_4().child(self.comment_card(
-            format!("pr-{n}-body"),
-            &p.author.login,
-            "opened".into(),
-            util::parse_time(&p.created_at),
-            &pr.body,
-            None,
-            window,
-            cx,
-        ));
-        for (_, item) in items {
-            thread = thread.child(item);
+        for (k, thread) in pr.threads.iter().enumerate() {
+            let login = thread.root.login();
+            items.push((
+                util::parse_time(&thread.root.created_at),
+                self.avatar(Some(&login), &login, AVATAR, cx),
+                self.review_thread(n, k, thread, window, cx),
+            ));
         }
-        // Merge readiness, as GitHub reports it.
-        let (glyph, color, title, detail) = match (p.state.as_str(), pr.mergeable.as_str(), pr.merge_state_status.as_str()) {
-            ("MERGED", _, _) => (Glyph::Merge.into(), colors.purple, "Merged", "This pull request has been merged.".to_string()),
-            ("CLOSED", _, _) => (Glyph::PullRequestClosed.into(), colors.red, "Closed", "Closed without merging.".to_string()),
+        items.sort_by_key(|(at, _, _)| *at);
+
+        // Where the pull request stands, with when it merged or closed.
+        let ended = match p.state.as_str() {
+            "MERGED" => pr.merged_at.as_deref(),
+            "CLOSED" => pr.closed_at.as_deref(),
+            _ => None,
+        }
+        .map(util::parse_time)
+        .filter(|t| *t > 0);
+        let (glyph, color, title, detail): (gpui_component::Icon, u32, &str, String) = match (p.state.as_str(), pr.mergeable.as_str(), pr.merge_state_status.as_str()) {
+            ("MERGED", _, _) => (Glyph::Merge.into(), colors.purple, "Merged", format!("into {}", p.base_ref_name)),
+            ("CLOSED", _, _) => (Glyph::PullRequestClosed.into(), colors.red, "Closed", "without merging".to_string()),
             (_, "CONFLICTING", _) => (IconName::TriangleAlert.into(), colors.red, "Conflicts", "Resolve conflicts with the base branch before merging.".into()),
             (_, _, "BLOCKED") => (Glyph::Lock.into(), colors.amber, "Blocked", "Required reviews or checks haven’t passed yet.".into()),
             (_, _, "BEHIND") => (Glyph::Fetch.into(), colors.amber, "Behind base", "The head branch is out of date with the base branch.".into()),
@@ -634,18 +786,18 @@ impl Workspace {
             (_, "MERGEABLE", _) => (IconName::CircleCheck.into(), colors.green, "Ready to merge", "No conflicts with the base branch.".into()),
             _ => (Glyph::CircleDashed.into(), colors.muted, "Checking mergeability", "GitHub is still computing whether this can merge.".into()),
         };
-        let status: gpui_component::Icon = glyph;
-        thread = thread.child(
-            row()
-                .gap_3()
-                .p_3()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(rgb(colors.border))
-                .child(status.size(px(18.)).text_color(rgb(color)))
-                .child(col().gap(px(2.)).child(div().font_weight(FontWeight::MEDIUM).child(title)).child(label(colors, detail))),
-        );
-        let open = p.state == "OPEN";
+        let status = row()
+            .min_h(px(AVATAR))
+            .gap(px(6.))
+            .text_size(px(13.))
+            .child(div().flex_shrink_0().font_weight(FontWeight::SEMIBOLD).text_color(rgb(color)).child(title))
+            .child(div().min_w_0().truncate().text_color(rgb(colors.muted)).child(detail))
+            .when_some(ended, |s, at| {
+                s.child(div().text_color(rgb(colors.quiet)).child("•"))
+                    .child(div().flex_shrink_0().text_color(rgb(colors.muted)).child(stamp(at)))
+            });
+        items.push((i64::MAX, self.badge(glyph, color, cx), status));
+
         let composer = col()
             .gap_2()
             .child(Input::new(&t.composer))
@@ -665,25 +817,49 @@ impl Workspace {
                             .on_click(cx.listener(|s, _, w, cx| s.submit(&Submit, w, cx))),
                     ),
             );
-        let _ = open;
+        let me = self.user.data.as_ref().map(|u| u.login.clone());
+        items.push((i64::MAX, self.avatar(me.as_deref(), "you", AVATAR, cx), composer));
+
+        // The rail: each item's avatar column carries the line down to the next.
+        let last = items.len() - 1;
+        let mut thread = col();
+        for (i, (_, avatar, content)) in items.into_iter().enumerate() {
+            thread = thread.child(
+                div()
+                    .relative()
+                    .flex()
+                    .w_full()
+                    // Absolute so it spans the item's full height, through to the next avatar.
+                    .when(i < last, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(AVATAR / 2. - 1.))
+                                .top(px(AVATAR))
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(rgb(rail_color(colors))),
+                        )
+                    })
+                    .child(col().w(px(AVATAR)).flex_shrink_0().items_center().child(avatar))
+                    .child(
+                        content
+                            .flex_1()
+                            .min_w_0()
+                            .pl(px(RAIL_INSET - AVATAR))
+                            .pt(px(7.))
+                            .pb(px(if i < last { 26. } else { 0. })),
+                    ),
+            );
+        }
         div()
             .id(("conversation", t.id))
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&t.page_scroll)
-            .child(
-                col()
-                    .p_4()
-                    .gap_4()
-                    .max_w(px(900.))
-                    .w_full()
-                    .mx_auto()
-                    .child(thread)
-                    .child(row().items_start().gap_3().child(self.avatar(self.user.data.as_ref().map(|u| u.login.as_str()), "you", 28., cx)).child(div().flex_1().child(composer))),
-            )
+            .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(thread))
             .into_any_element()
     }
-
     fn pr_commits(&self, pr: &gh::PullDetail, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let mono = settings::mono(cx);

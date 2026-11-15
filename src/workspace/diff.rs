@@ -172,6 +172,11 @@ impl Workspace {
             }),
         )
         .track_scroll(scroll)
+        // Inside a horizontal scroller: keep sideways swipes from also scrolling rows.
+        .map(|mut list| {
+            list.style().restrict_scroll_to_axis = Some(true);
+            list
+        })
         .h_full()
         .min_w(px(width))
         .w_full();

@@ -21,6 +21,7 @@ use gpui_component::{
 
 const COMMIT_ROW: f32 = 30.;
 const GRAPH_MAX: f32 = 300.;
+const GRAPH_MIN: f32 = 58.;
 
 fn ref_colors(colors: Palette, kind: RefKind) -> (u32, u32) {
     match kind {
@@ -193,7 +194,8 @@ impl Workspace {
         if g.commits.is_empty() {
             return empty(colors, Glyph::Commit, "No commits", "This branch has no history yet.").into_any_element();
         }
-        let graph_w = paint::width(g.graph.lanes).min(GRAPH_MAX);
+        // Wide enough for the "Graph" header even with a single lane.
+        let graph_w = paint::width(g.graph.lanes).clamp(GRAPH_MIN, GRAPH_MAX);
         let tab = t.id;
         let selected = t.commit.clone();
         let mono = settings::mono(cx);

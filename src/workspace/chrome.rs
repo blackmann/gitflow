@@ -148,6 +148,13 @@ impl Workspace {
                         move |_, cx| cx.reveal_path(&path),
                     )));
                 } else {
+                    let (w4, owner, name) = (weak.clone(), repo.owner.clone(), repo.name.clone());
+                    out.push(Entry::Item(Item::new("Clone…").icon(Glyph::Fetch).detail("gh repo clone").on_click(
+                        move |w, cx| {
+                            let (owner, name) = (owner.clone(), name.clone());
+                            let _ = w4.update(cx, |s, cx| s.clone_repo(owner, name, w, cx));
+                        },
+                    )));
                     out.push(Entry::Item(
                         Item::new("Link a local clone…").icon(Glyph::FolderGit).on_click(move |w, cx| {
                             let _ = w3.update(cx, |s, cx| s.add_local(&AddLocal, w, cx));
@@ -181,11 +188,15 @@ impl Workspace {
             let key = r.key();
             let is_active = active.as_ref() == Some(&key);
             let open = self.tabs.iter().any(|t| t.repo == key);
-            let loading = self.data(&key).is_some_and(|d| d.info.loading);
-            let tip = match &r.path {
+            let loading = self.data(&key).is_some_and(|d| d.info.loading && d.info.data.is_none());
+            let running = self.running_runs(&key);
+            let mut tip = match &r.path {
                 Some(p) => format!("{} · {}", r.slug(), p.display()),
                 None => r.slug(),
             };
+            if running > 0 {
+                tip.push_str(&format!("\n{running} workflow run{} in progress", if running == 1 { "" } else { "s" }));
+            }
             let (k1, k2) = (key.clone(), key.clone());
             list = list.child(
                 row()
@@ -223,7 +234,15 @@ impl Workspace {
                             ),
                     )
                     .when(loading, |s| s.child(spinner(colors)))
-                    .when(open && !is_active && !loading, |s| {
+                    .when(running > 0 && !loading, |s| {
+                        s.child(
+                            row()
+                                .gap(px(4.))
+                                .child(spinner(colors))
+                                .child(div().text_size(px(11.)).text_color(rgb(colors.amber)).child(running.to_string())),
+                        )
+                    })
+                    .when(open && !is_active && !loading && running == 0, |s| {
                         s.child(div().size(px(5.)).rounded_full().bg(rgb(colors.quiet)))
                     })
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -308,13 +327,17 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .child(div().truncate().child(account))
-                            .child(label(
-                                colors,
-                                match &self.gh_version.data {
-                                    Some(v) => format!("GitHub CLI {v}"),
-                                    None => "GitHub CLI".into(),
-                                },
-                            )),
+                            .child(
+                                label(
+                                    colors,
+                                    match &self.gh_version.data {
+                                        Some(v) => format!("gh cli {v}"),
+                                        None => "gh cli".into(),
+                                    },
+                                )
+                                .font_family(settings::mono(cx))
+                                .text_size(px(11.)),
+                            ),
                     )
                     .when(self.user.error.is_some(), |s| {
                         s.child(
@@ -370,7 +393,7 @@ impl Workspace {
             let repo = self.repo(&t.repo);
             let name = repo.map(|r| r.name.clone()).unwrap_or_else(|| t.repo.clone());
             let tip = format!("{} · {}", repo.map(Repo::slug).unwrap_or_default(), t.view.title());
-            let busy = self.data(&t.repo).is_some_and(|d| d.info.loading);
+            let busy = self.data(&t.repo).is_some_and(|d| d.info.loading && d.info.data.is_none());
             tabs = tabs.child(
                 row()
                     .id(("tab", t.id))
@@ -688,19 +711,33 @@ impl Workspace {
                 if let Some(l) = info.license_info.as_ref().filter(|l| !l.name.is_empty()) {
                     facts = facts.child(fact(Glyph::Scale.into(), l.name.clone()));
                 }
-                let flags = [
-                    info.is_private.then_some("Private"),
-                    info.is_fork.then_some("Fork"),
-                    info.is_archived.then_some("Archived"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+                let flags = [info.is_fork.then_some("Fork"), info.is_archived.then_some("Archived")]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
                 if !flags.is_empty() {
-                    facts = facts.child(fact(Glyph::Lock.into(), flags.join(" · ")));
+                    facts = facts.child(fact(Glyph::Fork.into(), flags.join(" · ")));
                 }
                 if let Some(pushed) = info.pushed_at.as_deref() {
                     facts = facts.child(fact(Glyph::History.into(), format!("Pushed {}", self.when(util::parse_time(pushed), cx))));
+                }
+                if let Some(origin) = data.and_then(|d| d.origin.data.clone()) {
+                    let shown = origin
+                        .trim_start_matches("git@github.com:")
+                        .trim_start_matches("https://github.com/")
+                        .trim_end_matches(".git")
+                        .to_string();
+                    facts = facts.child(
+                        fact(Glyph::Link.into(), format!("origin  {shown}"))
+                            .id("local-origin")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(colors.blue)))
+                            .tooltip(move |w, cx| Tooltip::new(format!("{origin} · click to copy")).build(w, cx))
+                            .on_click({
+                                let url = data.and_then(|d| d.origin.data.clone()).unwrap_or_default();
+                                move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                            }),
+                    );
                 }
                 if let Some(path) = repo.as_ref().and_then(|r| r.path.clone()) {
                     let shown = path.display().to_string().replace(&std::env::var("HOME").unwrap_or_default(), "~");
@@ -713,31 +750,7 @@ impl Workspace {
                     );
                 }
                 body = body.child(facts);
-                let ssh = info.ssh_url.clone();
-                let https = format!("{}.git", info.url);
-                body = body.child(
-                    row()
-                        .pt_2()
-                        .gap_1()
-                        .child(
-                            Button::new("copy-https")
-                                .label("HTTPS")
-                                .icon(IconName::Copy)
-                                .outline()
-                                .xsmall()
-                                .tooltip("Copy HTTPS clone URL")
-                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(https.clone()))),
-                        )
-                        .child(
-                            Button::new("copy-ssh")
-                                .label("SSH")
-                                .icon(IconName::Copy)
-                                .outline()
-                                .xsmall()
-                                .tooltip("Copy SSH clone URL")
-                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(ssh.clone()))),
-                        ),
-                );
+                body = body.child(self.activity_strip(colors, data, cx));
             }
             Some(Load { error: Some(e), .. }) => {
                 body = body.child(div().pt_3().text_color(rgb(colors.red)).text_size(px(12.)).child(e.clone()));
@@ -847,21 +860,164 @@ impl Workspace {
             .bg(rgb(colors.chrome))
             .border_l_1()
             .border_color(rgb(colors.border))
-            .child(
-                row()
-                    .h(px(BAR))
-                    .flex_shrink_0()
-                    .px_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(colors.border))
-                    .child(icon(IconName::Info).text_color(rgb(colors.muted)))
-                    .child("About")
-                    .child(div().flex_1())
-                    .when_some(repo, |s, r| s.child(label(colors, r.slug()).truncate())),
-            )
             .child(div().id("brief-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
             .into_any_element()
+    }
+    /// Commits per day for the last 30 days as a heat strip: grey for days without
+    /// commits, deepening shades of green for busier ones. Hovering opens a popover
+    /// docked under the strip; its arrow tracks the hovered day.
+    fn activity_strip(&self, colors: Palette, data: Option<&RepoData>, cx: &mut Context<Self>) -> Div {
+        let mono = settings::mono(cx);
+        let l = data.map(|d| &d.activity);
+        let Some(act) = l.and_then(|l| l.data.clone()) else {
+            return row()
+                .pt_4()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(rgb(colors.muted))
+                .when(l.and_then(|l| l.error.clone()).is_none(), |s| s.child(spinner(colors)).child("Reading activity…"));
+        };
+        let max = act.days.iter().map(|(_, c)| c.len()).max().unwrap_or(0).max(1) as f32;
+        let total: usize = act.days.iter().map(|(_, c)| c.len()).sum();
+        // Shades of green: faint for a quiet day, full green for the busiest.
+        let low = mix(colors.green, colors.background, 0.75);
+        let heat = move |n: usize| -> u32 {
+            if n == 0 {
+                return colors.hover;
+            }
+            mix(low, colors.green, (n as f32 / max).sqrt())
+        };
+        let days = act.days.len();
+        let hovered = self.activity_hover.filter(|i| *i < days);
+        let mut bars = row()
+            .id("activity-bars")
+            .h(px(26.))
+            .gap(px(2.))
+            // Gaps between bars keep the last day, so the popover doesn't flicker;
+            // leaving the strip closes it.
+            .on_hover(cx.listener(|s, over: &bool, _, cx| {
+                if !*over && s.activity_hover.take().is_some() {
+                    cx.notify();
+                }
+            }));
+        for (i, (_, commits)) in act.days.iter().enumerate() {
+            let lit = hovered == Some(i);
+            bars = bars.child(
+                div()
+                    .id(("activity", i))
+                    .flex_1()
+                    .h_full()
+                    .rounded(px(2.))
+                    .bg(rgb(heat(commits.len())))
+                    .when(lit, |s| s.border_1().border_color(rgb(colors.text)))
+                    .on_hover(cx.listener(move |s, over: &bool, _, cx| {
+                        if *over && s.activity_hover != Some(i) {
+                            s.activity_hover = Some(i);
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        // Docked under the strip at its full width; only the arrow follows the
+        // hovered bar. Deferred so it paints over the sections below.
+        let popover = hovered.map(|i| {
+            let (ts, commits) = &act.days[i];
+            let n = commits.len();
+            let centre = (i as f32 + 0.5) / days as f32;
+            let (fill, edge) = (colors.popover, colors.popover_border);
+            let arrow = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let (o, sz) = (bounds.origin, bounds.size);
+                    let apex = point(o.x + sz.width / 2., o.y);
+                    let left = point(o.x, o.y + sz.height);
+                    let right = point(o.x + sz.width, o.y + sz.height);
+                    let mut f = PathBuilder::fill();
+                    f.move_to(left);
+                    f.line_to(apex);
+                    f.line_to(right);
+                    f.close();
+                    if let Ok(path) = f.build() {
+                        window.paint_path(path, rgb(fill));
+                    }
+                    let mut st = PathBuilder::stroke(px(1.));
+                    st.move_to(left);
+                    st.line_to(apex);
+                    st.line_to(right);
+                    if let Ok(path) = st.build() {
+                        window.paint_path(path, rgb(edge));
+                    }
+                },
+            )
+            .absolute()
+            .top(px(-7.))
+            .left(relative(centre))
+            .ml(px(-7.))
+            .w(px(14.))
+            .h(px(8.));
+            deferred(
+                col()
+                    .absolute()
+                    .top(px(34.))
+                    .left_0()
+                    .right_0()
+                    .p(px(10.))
+                    .gap(px(5.))
+                    .rounded(px(8.))
+                    .bg(rgb(colors.popover))
+                    .border_1()
+                    .border_color(rgb(colors.popover_border))
+                    .shadow_lg()
+                    .occlude()
+                    .child(arrow)
+                    .child(
+                        row()
+                            .gap(px(6.))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(day(*ts)))
+                            .child(div().text_color(rgb(colors.quiet)).child("•"))
+                            .child(div().text_color(rgb(colors.muted)).child(format!("{n} commit{}", if n == 1 { "" } else { "s" }))),
+                    )
+                    .when(n == 0, |s| s.child(div().text_size(px(12.)).text_color(rgb(colors.muted)).child("No commits this day")))
+                    .children(commits.iter().take(3).map(|c| {
+                        row()
+                            .w_full()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(mono.clone())
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(colors.muted))
+                                    .child(util::short_sha(&c.sha).to_string()),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(c.subject.clone()))
+                    }))
+                    .when(n > 3, |s| s.child(div().text_size(px(11.5)).text_color(rgb(colors.quiet)).child(format!("and {} more", n - 3)))),
+            )
+            .with_priority(1)
+        });
+        col()
+            .pt_4()
+            .gap(px(6.))
+            .child(
+                row()
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.muted))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Last 30 days")
+                    .child(div().flex_1())
+                    .child(format!("{} commit{}", util::thousands(total as u64), if total == 1 { "" } else { "s" })),
+            )
+            .child(div().relative().child(bars).children(popover))
+            .child(
+                row()
+                    .justify_between()
+                    .text_size(px(11.))
+                    .text_color(rgb(colors.quiet))
+                    .child(act.days.first().map(|(t, _)| day(*t)).unwrap_or_default())
+                    .child("Today"),
+            )
     }
     fn brief_header(&self, colors: Palette, title: &'static str, count: Option<usize>, view: View, cx: &mut Context<Self>) -> Stateful<Div> {
         row()
@@ -906,10 +1062,6 @@ impl Workspace {
                 toggle(colors, "sidebar-toggle", IconName::PanelLeft, "Toggle sidebar · ⌘ B", self.sidebar)
                     .on_click(cx.listener(|s, _, w, cx| s.toggle_sidebar(&ToggleSidebar, w, cx))),
             )
-            .child(
-                toggle(colors, "brief-toggle", IconName::PanelRight, "Toggle brief · ⌘ ⌥ B", self.brief)
-                    .on_click(cx.listener(|s, _, w, cx| s.toggle_brief(&ToggleBrief, w, cx))),
-            )
             .child(divider(colors))
             .child(
                 row()
@@ -945,11 +1097,6 @@ impl Workspace {
             .when_some(self.busy.clone(), |s, b| {
                 s.child(row().gap(px(6.)).px_2().child(spinner(colors)).child(b))
             })
-            .child(div().px_2().child(match settings::get(cx).refresh_secs {
-                0 => "Auto-refresh off".to_string(),
-                n if n < 60 => format!("Refresh every {n}s"),
-                n => format!("Refresh every {}m", n / 60),
-            }))
             .into_any_element()
     }
 
@@ -1046,6 +1193,7 @@ impl Workspace {
             .occlude()
             .flex()
             .justify_center()
+            .items_start()
             .pt(px(120.))
             .bg(rgba(colors.scrim))
             .on_mouse_down(
@@ -1072,6 +1220,8 @@ impl Workspace {
                             .px_4()
                             .gap_2()
                             .bg(rgb(colors.chrome))
+                            // GPUI does not clip children to a parent's radius; match it inside the 1px border.
+                            .rounded_t(px(9.))
                             .border_b_1()
                             .border_color(rgb(colors.border))
                             .child(icon(Glyph::Link).text_color(rgb(colors.muted)))
@@ -1086,8 +1236,22 @@ impl Workspace {
                             .child(
                                 row()
                                     .gap_2()
-                                    .child(label(colors, "Any repository your gh account can read. Link a clone later for the full graph."))
-                                    .child(div().flex_1())
+                                    .child(
+                                        label(colors, "Clone downloads a local copy for the full branch graph.")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .line_height(relative(1.4)),
+                                    )
+                                    .child(
+                                        Button::new("add-url-clone")
+                                            .label("Clone…")
+                                            .icon(Glyph::Fetch)
+                                            .outline()
+                                            .small()
+                                            .disabled(self.adding || self.busy.is_some())
+                                            .tooltip("gh repo clone into a folder you choose")
+                                            .on_click(cx.listener(|s, _, w, cx| s.submit_url(true, w, cx))),
+                                    )
                                     .child(
                                         Button::new("add-url-submit")
                                             .label("Add")
@@ -1095,7 +1259,7 @@ impl Workspace {
                                             .small()
                                             .loading(self.adding)
                                             .disabled(self.adding)
-                                            .on_click(cx.listener(|s, _, w, cx| s.submit_url(w, cx))),
+                                            .on_click(cx.listener(|s, _, w, cx| s.submit_url(false, w, cx))),
                                     ),
                             ),
                     ),

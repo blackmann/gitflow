@@ -193,8 +193,9 @@ impl Workspace {
             picker(
                 colors,
                 "pref-refresh-trigger",
-                REFRESH_CHOICES.iter().find(|(s, _)| *s == prefs.refresh_secs).map(|(_, l)| l.to_string()).unwrap_or_else(|| format!("{}s", prefs.refresh_secs)),
-            ),
+                REFRESH_CHOICES.iter().find(|(s, _)| *s == prefs.refresh_secs).map(|(_, l)| format!("Every {}", l)).unwrap_or_else(|| format!("{}s", prefs.refresh_secs)),
+            )
+            .disabled(!prefs.auto_refresh),
             None,
             200.,
             |_, weak, cx| {
@@ -212,13 +213,31 @@ impl Workspace {
             cx,
         );
         let weak = cx.weak_entity();
+        let refresh_switch = {
+            let weak = cx.weak_entity();
+            Switch::new("pref-auto-refresh").checked(prefs.auto_refresh).on_click(move |on: &bool, _, cx| {
+                let on = *on;
+                let _ = weak.update(cx, |s, cx| s.update_settings(cx, |p| p.auto_refresh = on));
+            })
+        };
         col()
             .child(page_header(colors, mono.clone(), "General", "Tabs and data"))
             .child(group(colors, mono.clone(), "Tabs"))
             .child(setting(colors, "Open repositories on", "The view a new repository tab starts with. Duplicated tabs keep their own.", view))
             .child(group(colors, mono.clone(), "Data"))
             .child(setting(colors, "Commit graph depth", "How much history the Commits view reads. Larger graphs take longer on remote-only repositories.", limit))
-            .child(setting(colors, "Auto-refresh", "Re-read the visible view in the background. Running workflows are polled every few seconds regardless.", refresh))
+            .child(setting(
+                colors,
+                "Auto-refresh",
+                "Re-read the visible view in the background, and check every repository for running Actions. Refreshing never shows a loading indicator.",
+                refresh_switch,
+            ))
+            .child(setting(
+                colors,
+                "Refresh interval",
+                "How often auto-refresh runs. Workflow runs you are watching are polled every few seconds either way.",
+                refresh,
+            ))
             .child(setting(
                 colors,
                 "Relative dates",

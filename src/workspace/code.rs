@@ -8,7 +8,7 @@ use crate::{
     util,
 };
 use gpui::prelude::FluentBuilder;
-use gpui_component::{Disableable, IconName};
+use gpui_component::{ActiveTheme, Disableable, IconName};
 
 const LINE: f32 = 20.;
 
@@ -62,6 +62,98 @@ impl Workspace {
             },
             cx,
         )
+    }
+
+    /// The branch's latest commit beside the branch switcher, with the state of
+    /// the workflow runs it triggered. Clicking the state opens the run.
+    fn head_commit(&self, t: &Tab, branch: &str, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let l = self
+            .data(&t.repo)
+            .and_then(|d| d.folder.get(&(branch.to_string(), t.path.clone())));
+        let Some(info) = l.and_then(|l| l.data.clone()) else {
+            return row()
+                .flex_1()
+                .gap_2()
+                .text_color(rgb(colors.muted))
+                .when(l.is_none_or(|l| l.loading), |s| s.child(spinner(colors)).child("Reading latest commit…"));
+        };
+        let Some(head) = info.head.clone() else {
+            return row().flex_1().text_color(rgb(colors.muted)).child("No commits on this branch");
+        };
+        let mono = settings::mono(cx);
+        // Runs for this commit decide the badge; GitHub's check rollup is the fallback.
+        let state = if info.runs.iter().any(gh::Run::active) {
+            Some(gh::CheckState::Pending)
+        } else if info.runs.iter().any(|r| matches!(r.conclusion.as_str(), "failure" | "timed_out" | "startup_failure")) {
+            Some(gh::CheckState::Fail)
+        } else if info.runs.iter().any(|r| r.conclusion == "success") {
+            Some(gh::CheckState::Pass)
+        } else {
+            head.checks
+        };
+        let first_run = info.runs.first().map(|r| r.database_id);
+        let summary = if info.runs.is_empty() {
+            "Checks on this commit".to_string()
+        } else {
+            info.runs
+                .iter()
+                .map(|r| format!("{}: {}", r.workflow_name, if r.active() { r.status.replace('_', " ") } else { r.conclusion.clone() }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let sha = head.commit.sha.clone();
+        row()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .px_1()
+            .child(self.avatar(head.login.as_deref(), &head.author, 18., cx))
+            .child(div().flex_shrink_0().font_weight(FontWeight::MEDIUM).child(head.author.clone()))
+            .child(div().flex_1().min_w_0().truncate().text_color(rgb(colors.muted)).child(head.commit.message.clone()))
+            .when_some(state, |s, state| {
+                let badge = match state {
+                    gh::CheckState::Pending => spinner(colors).into_any_element(),
+                    other => check_icon(colors, other).into_any_element(),
+                };
+                s.child(
+                    div()
+                        .id("head-checks")
+                        .flex_shrink_0()
+                        .p(px(3.))
+                        .rounded(px(4.))
+                        .when(first_run.is_some(), |d| d.cursor_pointer().hover(|d| d.bg(rgb(colors.hover))))
+                        .child(badge)
+                        .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(summary.clone()).build(w, cx))
+                        .when_some(first_run, |d, run| {
+                            d.on_click(cx.listener(move |s, _, _, cx| {
+                                if let Some(t) = s.current_mut() {
+                                    t.view = View::Actions;
+                                    t.run = Some(run);
+                                    t.job = None;
+                                    t.log_open = false;
+                                }
+                                cx.notify();
+                            }))
+                        }),
+                )
+            })
+            .child(
+                div()
+                    .id("head-sha")
+                    .flex_shrink_0()
+                    .px_1()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(colors.hover)))
+                    .font_family(mono)
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.muted))
+                    .child(util::short_sha(&sha).to_string())
+                    .tooltip(|w, cx| gpui_component::tooltip::Tooltip::new("Copy full SHA").build(w, cx))
+                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()))),
+            )
+            .child(div().flex_shrink_0().pr_1().text_size(px(12.)).text_color(rgb(colors.muted)).child(self.when(head.commit.time, cx)))
     }
 
     fn breadcrumbs(&self, colors: Palette, t: &Tab, repo_name: String, cx: &mut Context<Self>) -> Div {
@@ -130,6 +222,14 @@ impl Workspace {
             .border_color(rgb(colors.row_border))
             .child(self.branch_button("code-branch", branch.clone(), cx))
             .child(divider(colors))
+            .child(self.head_commit(t, &branch, cx));
+        let crumbs = row()
+            .h(px(32.))
+            .flex_shrink_0()
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(rgb(colors.row_border))
             .child(self.breadcrumbs(colors, t, repo.name.clone(), cx))
             .child(div().flex_1())
             .when_some(t.file.clone(), |s, file| {
@@ -139,9 +239,9 @@ impl Workspace {
                     .and_then(|l| l.data.clone());
                 s.child(
                     icon_button("copy-file", IconName::Copy, "Copy file contents")
-                        .disabled(!matches!(raw.as_deref(), Some(BlobView::Text(_))))
+                        .disabled(!matches!(raw.as_deref(), Some(BlobView::Text(..))))
                         .on_click(move |_, _, cx| {
-                            if let Some(BlobView::Text(lines)) = raw.as_deref() {
+                            if let Some(BlobView::Text(lines, _)) = raw.as_deref() {
                                 let text = lines.iter().map(|l| l.as_ref()).collect::<Vec<&str>>().join("\n");
                                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
@@ -161,11 +261,12 @@ impl Workspace {
             .size_full()
             .bg(rgb(colors.background))
             .child(header)
+            .child(crumbs)
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
 
-    fn folder_view(&self, colors: Palette, t: &Tab, branch: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn folder_view(&self, colors: Palette, t: &Tab, branch: &str, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let data = self.data(&t.repo);
         let key = (branch.to_string(), t.path.clone());
         let l = data.and_then(|d| d.tree.get(&key));
@@ -195,7 +296,12 @@ impl Workspace {
                     })),
             );
         }
+        let folder = data
+            .and_then(|d| d.folder.get(&key))
+            .and_then(|l| l.data.clone());
+        let mono = settings::mono(cx);
         for (i, e) in entries.iter().enumerate() {
+            let last = folder.as_ref().and_then(|f| f.files.get(&e.path));
             let dir = e.is_dir();
             let path = e.path.clone();
             let glyph = match e.kind.as_str() {
@@ -214,8 +320,36 @@ impl Workspace {
                     .when(i > 0 || !t.path.is_empty(), |s| s.border_t_1().border_color(rgb(colors.row_border)))
                     .hover(|s| s.bg(rgb(colors.hover)))
                     .child(glyph.size(px(14.)))
-                    .child(div().flex_1().min_w_0().truncate().child(e.name.clone()))
-                    .when(!dir && e.size > 0, |s| s.child(label(colors, util::bytes(e.size))))
+                    .child(div().w(relative(0.3)).min_w(px(140.)).flex_shrink_0().truncate().child(e.name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(colors.muted))
+                            .child(last.map(|c| c.message.clone()).unwrap_or_default()),
+                    )
+                    .when_some(last, |s, c| {
+                        s.child(
+                            div()
+                                .w(px(62.))
+                                .flex_shrink_0()
+                                .font_family(mono.clone())
+                                .text_size(px(11.5))
+                                .text_color(rgb(colors.quiet))
+                                .child(util::short_sha(&c.sha).to_string()),
+                        )
+                        .child(
+                            div()
+                                .w(px(76.))
+                                .flex_shrink_0()
+                                .text_right()
+                                .text_size(px(12.))
+                                .text_color(rgb(colors.muted))
+                                .child(self.when(c.time, cx)),
+                        )
+                    })
+                    .when(last.is_none() && !dir && e.size > 0, |s| s.child(label(colors, util::bytes(e.size))))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(t) = s.current_mut() {
                             if dir {
@@ -255,13 +389,12 @@ impl Workspace {
                             .child(div().font_weight(FontWeight::MEDIUM).child(readme.name.clone())),
                     )
                     .child(div().p_5().child(match blob.as_deref() {
-                        Some(BlobView::Text(lines)) if md => markdown(
+                        Some(BlobView::Text(lines, _)) if md => markdown_doc(
                             format!("readme-{}-{}", t.repo, readme.path),
                             &lines.iter().map(|l| l.as_ref()).collect::<Vec<&str>>().join("\n"),
-                            window,
                             cx,
                         ),
-                        Some(BlobView::Text(lines)) => div()
+                        Some(BlobView::Text(lines, _)) => div()
                             .font_family(settings::mono(cx))
                             .text_size(px(settings::get(cx).mono_size as f32))
                             .children(lines.iter().take(400).map(|l| div().min_h(px(LINE)).child(l.clone())))
@@ -289,7 +422,7 @@ impl Workspace {
         }
         let blob = l.and_then(|l| l.data.clone()).unwrap();
         let lines = match blob.as_ref() {
-            BlobView::Text(lines) => lines.len(),
+            BlobView::Text(lines, _) => lines.len(),
             BlobView::Binary(n) => {
                 return empty(colors, IconName::File, "Binary file", format!("{} · open it on GitHub to download", util::bytes(*n)))
                     .into_any_element();
@@ -304,16 +437,22 @@ impl Workspace {
         let gutter = 16. + 8. * lines.to_string().len() as f32;
         let tab = t.id;
         let longest = match blob.as_ref() {
-            BlobView::Text(l) => l.iter().map(|s| s.len()).max().unwrap_or(0),
+            BlobView::Text(l, _) => l.iter().map(|s| s.len()).max().unwrap_or(0),
             _ => 0,
         };
-        let width = gutter + 24. + longest.min(2000) as f32 * settings::get(cx).mono_size as f32 * 0.62;
+        // Room after the longest line for an inline blame note.
+        let width = gutter + 24. + longest.min(2000) as f32 * settings::get(cx).mono_size as f32 * 0.62 + 420.;
+        let blame = self
+            .data(&t.repo)
+            .and_then(|d| d.blame.get(&(branch.to_string(), file.to_string())))
+            .and_then(|l| l.data.clone());
         let list = uniform_list(
             ("file-lines", tab),
             lines,
-            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(move |s, range: std::ops::Range<usize>, _, cx| {
                 let colors = palette(cx);
-                let BlobView::Text(text) = blob.as_ref() else {
+                let dark = cx.theme().mode.is_dark();
+                let BlobView::Text(text, highlights) = blob.as_ref() else {
                     return vec![];
                 };
                 text[range.clone()]
@@ -321,11 +460,30 @@ impl Workspace {
                     .cloned()
                     .enumerate()
                     .map(|(k, line)| {
-                        let n = range.start + k + 1;
+                        let at = range.start + k;
+                        let styles = highlights.as_ref().and_then(|h| h.line(dark, at)).filter(|st| !st.is_empty());
+                        let code = match styles {
+                            Some(st) => StyledText::new(line).with_highlights(st.clone()).into_any_element(),
+                            None => line.into_any_element(),
+                        };
+                        // Inline blame for the hovered line, as in Zed: who, when, why.
+                        let blamed = (s.code_hover == Some(at))
+                            .then(|| blame.as_ref().and_then(|b| b.at(at)).cloned())
+                            .flatten();
                         row()
+                            .id(("line", at))
                             .h(px(LINE))
                             .w_full()
                             .hover(|s| s.bg(rgb(colors.chrome)))
+                            .on_hover(cx.listener(move |s, over: &bool, _, cx| {
+                                if *over && s.code_hover != Some(at) {
+                                    s.code_hover = Some(at);
+                                    cx.notify();
+                                } else if !*over && s.code_hover == Some(at) {
+                                    s.code_hover = None;
+                                    cx.notify();
+                                }
+                            }))
                             .child(
                                 div()
                                     .w(px(gutter))
@@ -333,14 +491,48 @@ impl Workspace {
                                     .pr_3()
                                     .text_right()
                                     .text_color(rgb(colors.quiet))
-                                    .child(n.to_string()),
+                                    .child((at + 1).to_string()),
                             )
-                            .child(div().pl_2().whitespace_nowrap().child(line))
+                            .child(div().pl_2().whitespace_nowrap().child(code))
+                            .when_some(blamed, |r, c| {
+                                let sha = c.sha.clone();
+                                r.child(
+                                    div()
+                                        .id(("blame", at))
+                                        .ml(px(40.))
+                                        .flex_shrink_0()
+                                        .whitespace_nowrap()
+                                        .font_family(".SystemUIFont")
+                                        .text_size(px(12.))
+                                        .text_color(rgb(colors.quiet))
+                                        .cursor_pointer()
+                                        .hover(|d| d.text_color(rgb(colors.muted)))
+                                        .child(format!(
+                                            "{}, {} • {}  {}",
+                                            c.author,
+                                            s.when(c.time, cx),
+                                            c.message,
+                                            util::short_sha(&c.sha)
+                                        ))
+                                        .on_click(cx.listener(move |s, _, _, cx| {
+                                            if let Some(t) = s.current_mut() {
+                                                t.view = View::Commits;
+                                                t.commit = Some(sha.clone());
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                     })
                     .collect()
             }),
         )
         .track_scroll(t.list_scroll.clone())
+        // Inside a horizontal scroller: keep sideways swipes from also scrolling rows.
+        .map(|mut list| {
+            list.style().restrict_scroll_to_axis = Some(true);
+            list
+        })
         .h_full()
         .min_w(px(width))
         .w_full();
