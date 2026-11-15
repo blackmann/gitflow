@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+mode="${GITFLOW_BUILD_MODE:-release}"
+case "$mode" in
+  debug) cargo build --locked ;;
+  release) cargo build --release --locked ;;
+  *) printf "Unknown build mode: %s\n" "$mode" >&2; exit 1 ;;
+esac
+app="build/Gitflow.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "target/$mode/gitflow" "$app/Contents/MacOS/gitflow"
+cat > "$app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>gitflow</string>
+<key>CFBundleIdentifier</key><string>com.gitflow.desktop</string>
+<key>CFBundleName</key><string>Gitflow</string>
+<key>CFBundleDisplayName</key><string>Gitflow</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>12.0</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+PLIST
+codesign --force --deep --sign - "$app"
+printf 'Built %s\n' "$app"

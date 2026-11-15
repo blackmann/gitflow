@@ -1,0 +1,1278 @@
+//! The frame around repository views: title bar, repository sidebar, tab strip,
+//! the repo's view switcher, its brief panel, status bar and overlays.
+use super::ui::*;
+use super::*;
+use crate::{
+    icons::Glyph,
+    menu::{Entry, Item},
+    util,
+};
+use gpui::prelude::FluentBuilder;
+use gpui_component::{
+    Disableable,
+    Icon, IconName, Sizable, TitleBar,
+    button::{Button, ButtonVariants},
+    input::Input,
+    resizable::*,
+    tooltip::Tooltip,
+};
+
+pub fn view_glyph(view: View) -> Icon {
+    match view {
+        View::Code => Glyph::Code.into(),
+        View::Commits => Glyph::Graph.into(),
+        View::Pulls => Glyph::PullRequest.into(),
+        View::Actions => Glyph::CirclePlay.into(),
+        View::Releases => Glyph::Tag.into(),
+    }
+}
+
+impl Workspace {
+    fn title(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let tab = self.current();
+        let repo = tab.and_then(|t| self.repo(&t.repo));
+        let private = tab
+            .and_then(|t| self.data(&t.repo))
+            .and_then(|d| d.info.data.as_ref())
+            .is_some_and(|i| i.is_private);
+        TitleBar::new()
+            .bg(rgb(colors.chrome))
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .child(
+                row()
+                    .w_full()
+                    .min_w_0()
+                    .pr_2()
+                    .gap(px(6.))
+                    .text_size(px(13.))
+                    .child(icon(Glyph::Graph).text_color(rgb(colors.blue)))
+                    .child(div().font_weight(FontWeight::MEDIUM).child("Gitflow"))
+                    .when_some(repo, |s, r| {
+                        s.child(div().text_color(rgb(colors.quiet)).child("/"))
+                            .child(div().text_color(rgb(colors.muted)).child(r.owner.clone()))
+                            .child(div().text_color(rgb(colors.quiet)).child("/"))
+                            .child(div().child(r.name.clone()))
+                            .when(private, |s| {
+                                s.child(icon(Glyph::Lock).size(px(11.)).text_color(rgb(colors.muted)))
+                            })
+                            .when_some(tab, |s, t| {
+                                s.child(div().text_color(rgb(colors.quiet)).child("·"))
+                                    .child(div().text_color(rgb(colors.muted)).child(t.view.title()))
+                            })
+                    })
+                    .child(div().flex_1())
+                    .when_some(self.busy.clone(), |s, busy| {
+                        s.child(
+                            row()
+                                .gap(px(6.))
+                                .mr_2()
+                                .text_color(rgb(colors.muted))
+                                .child(spinner(colors))
+                                .child(format!("{busy}…")),
+                        )
+                    })
+                    .when(tab.is_some(), |s| {
+                        s.child(
+                            icon_button("refresh", Glyph::Refresh, "Refresh · ⌘ R")
+                                .on_click(cx.listener(|s, _, w, cx| s.refresh(&Refresh, w, cx))),
+                        )
+                        .child(
+                            toggle(
+                                colors,
+                                "toggle-brief",
+                                IconName::PanelRight,
+                                "Toggle repository brief · ⌘ ⌥ B",
+                                self.brief,
+                            )
+                            .on_click(cx.listener(|s, _, w, cx| s.toggle_brief(&ToggleBrief, w, cx))),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn add_menu(&self, id: &'static str, trigger: Button, cx: &mut Context<Self>) -> Div {
+        self.popover_button(id, trigger, None, 250., |_, weak, _| {
+            let (a, b) = (weak.clone(), weak);
+            vec![
+                Entry::Item(
+                    Item::new("Add local repository…")
+                        .icon(Glyph::FolderGit)
+                        .detail("⌘O")
+                        .on_click(move |w, cx| {
+                            let _ = a.update(cx, |s, cx| s.add_local(&AddLocal, w, cx));
+                        }),
+                ),
+                Entry::Item(
+                    Item::new("Add from GitHub URL…")
+                        .icon(Glyph::Link)
+                        .detail("⇧⌘O")
+                        .on_click(move |w, cx| {
+                            let _ = b.update(cx, |s, cx| s.open_add_url(&AddUrl, w, cx));
+                        }),
+                ),
+            ]
+        }, cx)
+    }
+
+    fn repo_menu(&mut self, key: String, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        self.open_popover(
+            "repo-menu",
+            position,
+            None,
+            230.,
+            Rc::new(move |cx| {
+                let Some(w) = weak.upgrade() else { return vec![] };
+                let s = w.read(cx);
+                let Some(repo) = s.repo(&key).cloned() else { return vec![] };
+                let url = format!("https://github.com/{}", repo.slug());
+                let (k1, k2) = (key.clone(), key.clone());
+                let (w1, w2, w3) = (weak.clone(), weak.clone(), weak.clone());
+                let mut out = vec![
+                    Entry::Item(Item::new("Open in new tab").icon(IconName::Plus).on_click(move |win, cx| {
+                        let _ = w1.update(cx, |s, cx| s.open_repo_new_tab(&k1, win, cx));
+                    })),
+                    Entry::Item(Item::new("Open on GitHub").icon(IconName::ExternalLink).on_click({
+                        let url = url.clone();
+                        move |_, cx| cx.open_url(&url)
+                    })),
+                    Entry::Item(Item::new("Copy URL").icon(IconName::Copy).on_click(move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                    })),
+                ];
+                if let Some(path) = repo.path.clone() {
+                    out.push(Entry::Item(Item::new("Reveal in Finder").icon(IconName::FolderOpen).on_click(
+                        move |_, cx| cx.reveal_path(&path),
+                    )));
+                } else {
+                    out.push(Entry::Item(
+                        Item::new("Link a local clone…").icon(Glyph::FolderGit).on_click(move |w, cx| {
+                            let _ = w3.update(cx, |s, cx| s.add_local(&AddLocal, w, cx));
+                        }),
+                    ));
+                }
+                out.push(Entry::Separator);
+                out.push(Entry::Item(Item::new("Remove from sidebar").icon(IconName::Delete).on_click(
+                    move |_, cx| {
+                        let _ = w2.update(cx, |s, cx| s.remove_repo(&k2, cx));
+                    },
+                )));
+                out
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn sidebar_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let q = self.repo_search.read(cx).value().trim().to_lowercase();
+        let active = self.current().map(|t| t.repo.clone());
+        let mut list = col().py_1();
+        let shown = self
+            .repos
+            .iter()
+            .filter(|r| q.is_empty() || r.slug().to_lowercase().contains(&q))
+            .collect::<Vec<_>>();
+        for r in &shown {
+            let key = r.key();
+            let is_active = active.as_ref() == Some(&key);
+            let open = self.tabs.iter().any(|t| t.repo == key);
+            let loading = self.data(&key).is_some_and(|d| d.info.loading);
+            let tip = match &r.path {
+                Some(p) => format!("{} · {}", r.slug(), p.display()),
+                None => r.slug(),
+            };
+            let (k1, k2) = (key.clone(), key.clone());
+            list = list.child(
+                row()
+                    .id(SharedString::from(format!("repo-{key}")))
+                    .h(px(30.))
+                    .mx_1()
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(is_active, |s| s.bg(rgb(colors.selected)))
+                    .when(!is_active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                    .child(
+                        icon(if r.path.is_some() {
+                            Icon::from(Glyph::FolderGit)
+                        } else {
+                            Icon::from(IconName::GitHub)
+                        })
+                        .size(px(14.))
+                        .text_color(rgb(if is_active { colors.blue } else { colors.muted })),
+                    )
+                    .child(
+                        row()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(6.))
+                            .child(div().flex_shrink_0().max_w(relative(0.7)).truncate().child(r.name.clone()))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(colors.quiet))
+                                    .child(r.owner.clone()),
+                            ),
+                    )
+                    .when(loading, |s| s.child(spinner(colors)))
+                    .when(open && !is_active && !loading, |s| {
+                        s.child(div().size(px(5.)).rounded_full().bg(rgb(colors.quiet)))
+                    })
+                    .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                            cx.stop_propagation();
+                            s.repo_menu(k1.clone(), e.position, w, cx);
+                        }),
+                    )
+                    .on_click(cx.listener(move |s, e: &ClickEvent, w, cx| {
+                        if e.modifiers().platform {
+                            s.open_repo_new_tab(&k2, w, cx)
+                        } else {
+                            s.open_repo(&k2, w, cx)
+                        }
+                    })),
+            );
+        }
+        if self.repos.is_empty() {
+            list = list.child(
+                col()
+                    .p_3()
+                    .gap(px(6.))
+                    .child(div().text_color(rgb(colors.muted)).child("No repositories yet"))
+                    .child(label(colors, "Add a local clone or a GitHub URL to get started.").line_height(relative(1.45))),
+            );
+        } else if shown.is_empty() {
+            list = list.child(div().p_3().text_color(rgb(colors.muted)).child("No matches"));
+        }
+        let user = self.user.data.as_ref();
+        let account = match (&self.user, user) {
+            (_, Some(u)) => u.login.clone(),
+            (l, None) if l.loading => "Checking gh…".into(),
+            _ => "Not signed in".into(),
+        };
+        col()
+            .size_full()
+            .bg(rgb(colors.chrome))
+            .border_r_1()
+            .border_color(rgb(colors.border))
+            .child(
+                row()
+                    .h(px(BAR))
+                    .flex_shrink_0()
+                    .pl_3()
+                    .pr_1()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
+                    .child(div().font_weight(FontWeight::MEDIUM).child("Repositories"))
+                    .child(count_badge(colors, self.repos.len()))
+                    .child(div().flex_1())
+                    .child(self.add_menu(
+                        "add-repo",
+                        icon_button("add-repo-button", IconName::Plus, "Add repository"),
+                        cx,
+                    )),
+            )
+            .child(
+                row().px_2().pt_2().pb(px(6.)).child(
+                    Input::new(&self.repo_search)
+                        .w_full()
+                        .small()
+                        .prefix(icon(IconName::Search).text_color(rgb(colors.muted)))
+                        .cleanable(true),
+                ),
+            )
+            .child(div().id("repo-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+            .child(
+                row()
+                    .h(px(BAR + 4.))
+                    .flex_shrink_0()
+                    .px_2()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .text_size(px(13.))
+                    .child(self.avatar(user.map(|u| u.login.as_str()), &account, 20., cx))
+                    .child(
+                        col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(account))
+                            .child(label(
+                                colors,
+                                match &self.gh_version.data {
+                                    Some(v) => format!("GitHub CLI {v}"),
+                                    None => "GitHub CLI".into(),
+                                },
+                            )),
+                    )
+                    .when(self.user.error.is_some(), |s| {
+                        s.child(
+                            icon(IconName::TriangleAlert)
+                                .text_color(rgb(colors.amber))
+                                .size(px(13.)),
+                        )
+                    })
+                    .child(
+                        icon_button("open-prefs", IconName::Settings, "Preferences · ⌘ ,")
+                            .on_click(cx.listener(|s, _, w, cx| s.open_prefs(&OpenPreferences, w, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn tab_menu(&mut self, index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = Some(index);
+        let weak = cx.weak_entity();
+        self.open_popover(
+            "tab-menu",
+            position,
+            None,
+            220.,
+            Rc::new(move |cx| {
+                let Some(w) = weak.upgrade() else { return vec![] };
+                let many = w.read(cx).tabs.len() > 1;
+                let (a, b, c) = (weak.clone(), weak.clone(), weak.clone());
+                vec![
+                    Entry::Item(Item::new("Duplicate tab").detail("⇧⌘D").on_click(move |win, cx| {
+                        let _ = a.update(cx, |s, cx| s.duplicate(index, win, cx));
+                    })),
+                    Entry::Separator,
+                    Entry::Item(Item::new("Close tab").detail("⌘W").on_click(move |_, cx| {
+                        let _ = b.update(cx, |s, cx| s.close(index, cx));
+                    })),
+                    Entry::Item(Item::new("Close other tabs").disabled(!many).on_click(move |_, cx| {
+                        let _ = c.update(cx, |s, cx| s.close_others(index, cx));
+                    })),
+                ]
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn tabs_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let mut tabs = row().id("tabs-scroll").h_full().overflow_x_scroll();
+        for (i, t) in self.tabs.iter().enumerate() {
+            let active = self.active == Some(i);
+            let group = SharedString::from(format!("tab-{}", t.id));
+            let repo = self.repo(&t.repo);
+            let name = repo.map(|r| r.name.clone()).unwrap_or_else(|| t.repo.clone());
+            let tip = format!("{} · {}", repo.map(Repo::slug).unwrap_or_default(), t.view.title());
+            let busy = self.data(&t.repo).is_some_and(|d| d.info.loading);
+            tabs = tabs.child(
+                row()
+                    .id(("tab", t.id))
+                    .group(group.clone())
+                    .h_full()
+                    .min_w(px(140.))
+                    .max_w(px(250.))
+                    .pl_3()
+                    .pr_1()
+                    .gap(px(6.))
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(rgb(colors.border))
+                    .cursor_pointer()
+                    .map(|s| {
+                        if active {
+                            s.bg(rgb(colors.background)).text_color(rgb(colors.text))
+                        } else {
+                            s.border_b_1()
+                                .text_color(rgb(colors.muted))
+                                .hover(|s| s.text_color(rgb(colors.text)))
+                        }
+                    })
+                    .child(if busy {
+                        spinner(colors).into_any_element()
+                    } else {
+                        icon(view_glyph(t.view))
+                            .size(px(13.))
+                            .text_color(rgb(if active { colors.blue } else { colors.muted }))
+                            .into_any_element()
+                    })
+                    .child(
+                        row()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(5.))
+                            .child(div().flex_shrink_0().max_w(relative(0.75)).truncate().child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(colors.quiet))
+                                    .child(t.view.title()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .when(!active, |s| s.opacity(0.).group_hover(group, |s| s.opacity(1.)))
+                            .child(
+                                Button::new(("close", t.id))
+                                    .icon(icon(IconName::Close))
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Close tab · ⌘ W")
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.close(i, cx);
+                                    })),
+                            ),
+                    )
+                    .when(self.popup.is_none(), |tab| {
+                        tab.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                            cx.stop_propagation();
+                            s.tab_menu(i, e.position, w, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |s, _, _, cx| s.close(i, cx)),
+                    )
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        s.active = Some(i);
+                        s.focus.focus(w);
+                        cx.notify();
+                    })),
+            );
+        }
+        let new_tab = self.popover_button(
+            "new-tab",
+            icon_button("new-tab-button", IconName::Plus, "Open repository in a new tab"),
+            Some("Open repository…"),
+            320.,
+            |s, weak, _| {
+                s.repos
+                    .iter()
+                    .map(|r| {
+                        let weak = weak.clone();
+                        let key = r.key();
+                        Entry::Item(
+                            Item::new(r.slug())
+                                .icon(if r.path.is_some() {
+                                    Icon::from(Glyph::FolderGit)
+                                } else {
+                                    Icon::from(IconName::GitHub)
+                                })
+                                .on_click(move |w, cx| {
+                                    let _ = weak.update(cx, |s, cx| s.open_repo_new_tab(&key, w, cx));
+                                }),
+                        )
+                    })
+                    .collect()
+            },
+            cx,
+        );
+        let edge = || {
+            row()
+                .h_full()
+                .flex_shrink_0()
+                .px_1()
+                .gap(px(2.))
+                .border_b_1()
+                .border_color(rgb(colors.border))
+        };
+        let many = self.tabs.len() > 1;
+        row()
+            .h(px(BAR))
+            .flex_shrink_0()
+            .bg(rgb(colors.chrome))
+            .child(
+                edge()
+                    .border_r_1()
+                    .child(
+                        icon_button("prev-tab", IconName::ArrowLeft, "Previous tab · ⌘ ⇧ [")
+                            .disabled(!many)
+                            .on_click(cx.listener(|s, _, _, cx| s.cycle(-1, cx))),
+                    )
+                    .child(
+                        icon_button("next-tab", IconName::ArrowRight, "Next tab · ⌘ ⇧ ]")
+                            .disabled(!many)
+                            .on_click(cx.listener(|s, _, _, cx| s.cycle(1, cx))),
+                    ),
+            )
+            .child(div().min_w_0().h_full().child(tabs))
+            .child(div().flex_1().h_full().border_b_1().border_color(rgb(colors.border)))
+            .child(
+                edge()
+                    .child(
+                        icon_button("duplicate-tab", IconName::GalleryVerticalEnd, "Duplicate tab · ⇧ ⌘ D")
+                            .disabled(self.active.is_none())
+                            .on_click(cx.listener(|s, _, w, cx| s.duplicate_tab(&DuplicateTab, w, cx))),
+                    )
+                    .child(new_tab),
+            )
+            .into_any_element()
+    }
+
+    /// The repository's view switcher: Code, Commits, Pull requests, Actions, Releases.
+    fn nav(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let Some(t) = self.current() else {
+            return div().into_any_element();
+        };
+        let data = self.data(&t.repo);
+        let info = data.and_then(|d| d.info.data.as_ref());
+        let running = data
+            .and_then(|d| d.runs.get(&None))
+            .and_then(|l| l.data.as_ref())
+            .map(|r| r.iter().filter(|r| r.active()).count())
+            .unwrap_or(0);
+        let mut nav = row().h_full().gap(px(2.));
+        for (i, view) in View::ALL.into_iter().enumerate() {
+            let active = t.view == view;
+            let badge: Option<AnyElement> = match view {
+                View::Pulls => info
+                    .map(|i| i.pull_requests.total_count)
+                    .filter(|n| *n > 0)
+                    .map(|n| count_badge(colors, n as usize).into_any_element()),
+                View::Actions if running > 0 => Some(
+                    row()
+                        .gap(px(4.))
+                        .child(spinner(colors))
+                        .child(div().text_size(px(11.)).text_color(rgb(colors.amber)).child(running.to_string()))
+                        .into_any_element(),
+                ),
+                View::Releases => data
+                    .and_then(|d| d.releases.data.as_ref())
+                    .filter(|r| !r.is_empty())
+                    .map(|r| count_badge(colors, r.len()).into_any_element()),
+                _ => None,
+            };
+            nav = nav.child(
+                row()
+                    .id(("nav", i))
+                    .h_full()
+                    .px(px(10.))
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .border_b_2()
+                    .border_color(if active { rgb(colors.blue).into() } else { transparent_black() })
+                    .text_color(rgb(if active { colors.text } else { colors.muted }))
+                    .when(active, |s| s.font_weight(FontWeight::MEDIUM))
+                    .when(!active, |s| s.hover(|s| s.text_color(rgb(colors.text))))
+                    .child(
+                        icon(view_glyph(view))
+                            .size(px(14.))
+                            .text_color(rgb(if active { colors.blue } else { colors.muted })),
+                    )
+                    .child(view.title())
+                    .children(badge)
+                    .tooltip(move |w, cx| Tooltip::new(format!("{} · ⌘ {}", view.title(), i + 1)).build(w, cx))
+                    .on_click(cx.listener(move |s, _, _, cx| s.set_view(view, cx))),
+            );
+        }
+        let url = info.map(|i| i.url.clone());
+        row()
+            .h(px(BAR + 4.))
+            .flex_shrink_0()
+            .px_2()
+            .gap_1()
+            .bg(rgb(colors.background))
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .child(nav)
+            .child(div().flex_1())
+            .when_some(url, |s, url| {
+                let page = match t.view {
+                    View::Code => String::new(),
+                    View::Commits => "/commits".into(),
+                    View::Pulls => match t.pr {
+                        Some(n) => format!("/pull/{n}"),
+                        None => "/pulls".into(),
+                    },
+                    View::Actions => match t.run {
+                        Some(r) => format!("/actions/runs/{r}"),
+                        None => "/actions".into(),
+                    },
+                    View::Releases => "/releases".into(),
+                };
+                let full = format!("{url}{page}");
+                s.child(
+                    icon_button("open-github", IconName::ExternalLink, "Open this page on GitHub")
+                        .on_click(move |_, _, cx| cx.open_url(&full)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn brief_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let Some(t) = self.current() else {
+            return div().into_any_element();
+        };
+        let repo = self.repo(&t.repo).cloned();
+        let data = self.data(&t.repo);
+        let mut body = col().px_3().pb_4().gap_1();
+        match data.map(|d| &d.info) {
+            Some(Load { data: Some(info), .. }) => {
+                body = body.child(
+                    div()
+                        .pt_3()
+                        .line_height(relative(1.5))
+                        .text_color(rgb(if info.description.is_some() { colors.text } else { colors.muted }))
+                        .child(info.description.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| "No description".into())),
+                );
+                if let Some(topics) = info.repository_topics.as_ref().filter(|t| !t.is_empty()) {
+                    body = body.child(
+                        div().flex().flex_wrap().gap_1().pt_2().children(
+                            topics.iter().take(10).map(|t| pill(t.name.clone(), colors.blue, colors.blue_tint)),
+                        ),
+                    );
+                }
+                if let Some(home) = info.homepage_url.clone().filter(|h| !h.is_empty()) {
+                    let label_text = home.trim_start_matches("https://").trim_start_matches("http://").to_string();
+                    body = body.child(
+                        row()
+                            .id("homepage")
+                            .pt_2()
+                            .gap(px(6.))
+                            .cursor_pointer()
+                            .text_color(rgb(colors.blue))
+                            .child(icon(Glyph::Link).size(px(13.)))
+                            .child(div().truncate().child(label_text))
+                            .on_click(move |_, _, cx| cx.open_url(&home)),
+                    );
+                }
+                let stat = |glyph: Icon, n: u64, what: &'static str| {
+                    row()
+                        .gap(px(5.))
+                        .text_size(px(12.))
+                        .text_color(rgb(colors.muted))
+                        .child(glyph.size(px(13.)))
+                        .child(div().text_color(rgb(colors.text)).child(util::compact(n)))
+                        .child(what)
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_x_3()
+                        .gap_y_1()
+                        .pt_3()
+                        .child(stat(IconName::Star.into(), info.stargazer_count, "stars"))
+                        .child(stat(Glyph::Fork.into(), info.fork_count, "forks"))
+                        .child(stat(IconName::Eye.into(), info.watchers.total_count, "watching"))
+                        .child(stat(Glyph::CircleDot.into(), info.issues.total_count, "issues")),
+                );
+                let fact = |glyph: Icon, text: String| {
+                    row()
+                        .h(px(24.))
+                        .gap_2()
+                        .text_size(px(12.5))
+                        .child(glyph.size(px(13.)).text_color(rgb(colors.muted)))
+                        .child(div().min_w_0().truncate().child(text))
+                };
+                let mut facts = col().pt_3();
+                facts = facts.child(fact(Glyph::Branch.into(), info.default_branch()));
+                if let Some(l) = &info.primary_language {
+                    facts = facts.child(fact(Glyph::Code.into(), l.name.clone()));
+                }
+                if let Some(l) = info.license_info.as_ref().filter(|l| !l.name.is_empty()) {
+                    facts = facts.child(fact(Glyph::Scale.into(), l.name.clone()));
+                }
+                let flags = [
+                    info.is_private.then_some("Private"),
+                    info.is_fork.then_some("Fork"),
+                    info.is_archived.then_some("Archived"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                if !flags.is_empty() {
+                    facts = facts.child(fact(Glyph::Lock.into(), flags.join(" · ")));
+                }
+                if let Some(pushed) = info.pushed_at.as_deref() {
+                    facts = facts.child(fact(Glyph::History.into(), format!("Pushed {}", self.when(util::parse_time(pushed), cx))));
+                }
+                if let Some(path) = repo.as_ref().and_then(|r| r.path.clone()) {
+                    let shown = path.display().to_string().replace(&std::env::var("HOME").unwrap_or_default(), "~");
+                    facts = facts.child(
+                        fact(Glyph::FolderGit.into(), shown)
+                            .id("local-path")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(colors.blue)))
+                            .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                    );
+                }
+                body = body.child(facts);
+                let ssh = info.ssh_url.clone();
+                let https = format!("{}.git", info.url);
+                body = body.child(
+                    row()
+                        .pt_2()
+                        .gap_1()
+                        .child(
+                            Button::new("copy-https")
+                                .label("HTTPS")
+                                .icon(IconName::Copy)
+                                .outline()
+                                .xsmall()
+                                .tooltip("Copy HTTPS clone URL")
+                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(https.clone()))),
+                        )
+                        .child(
+                            Button::new("copy-ssh")
+                                .label("SSH")
+                                .icon(IconName::Copy)
+                                .outline()
+                                .xsmall()
+                                .tooltip("Copy SSH clone URL")
+                                .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(ssh.clone()))),
+                        ),
+                );
+            }
+            Some(Load { error: Some(e), .. }) => {
+                body = body.child(div().pt_3().text_color(rgb(colors.red)).text_size(px(12.)).child(e.clone()));
+            }
+            _ => body = body.child(row().pt_3().gap_2().text_color(rgb(colors.muted)).child(spinner(colors)).child("Loading…")),
+        }
+
+        // Releases
+        let releases = data.and_then(|d| d.releases.data.as_ref());
+        body = body.child(self.brief_header(colors, "Releases", releases.map(|r| r.len()), View::Releases, cx));
+        match releases {
+            Some(r) if r.is_empty() => body = body.child(label(colors, "No releases published")),
+            Some(r) => {
+                for (i, rel) in r.iter().filter(|r| !r.draft).take(3).enumerate() {
+                    let latest = i == 0 && !rel.prerelease;
+                    body = body.child(
+                        row()
+                            .id(("brief-release", i))
+                            .py(px(5.))
+                            .gap_2()
+                            .items_start()
+                            .cursor_pointer()
+                            .rounded(px(5.))
+                            .child(div().pt(px(2.)).child(icon(Glyph::Tag).size(px(13.)).text_color(rgb(if latest { colors.green } else { colors.muted }))))
+                            .child(
+                                col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        row()
+                                            .gap(px(6.))
+                                            .child(div().min_w_0().truncate().child(rel.title()))
+                                            .when(latest, |s| s.child(pill("Latest", colors.green, colors.green_tint)))
+                                            .when(rel.prerelease, |s| s.child(pill("Pre-release", colors.amber, colors.amber_tint))),
+                                    )
+                                    .child(label(colors, format!("{} · {}", rel.tag_name, self.when(rel.time(), cx)))),
+                            )
+                            .on_click(cx.listener(|s, _, _, cx| s.set_view(View::Releases, cx))),
+                    );
+                }
+            }
+            None => {}
+        }
+
+        // Recent runs
+        let runs = data.and_then(|d| d.runs.get(&None)).and_then(|l| l.data.as_ref());
+        body = body.child(self.brief_header(colors, "Recent runs", None, View::Actions, cx));
+        match runs {
+            Some(r) if r.is_empty() => body = body.child(label(colors, "No workflow runs")),
+            Some(r) => {
+                for run in r.iter().take(5) {
+                    let id = run.database_id;
+                    body = body.child(
+                        row()
+                            .id(("brief-run", id))
+                            .py(px(4.))
+                            .gap_2()
+                            .items_start()
+                            .cursor_pointer()
+                            .child(div().pt(px(2.)).child(run_icon(colors, &run.status, &run.conclusion)))
+                            .child(
+                                col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().truncate().text_size(px(12.5)).child(run.display_title.clone()))
+                                    .child(label(colors, format!("{} · {}", run.workflow_name, self.when(util::parse_time(&run.created_at), cx))).truncate()),
+                            )
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                if let Some(t) = s.current_mut() {
+                                    t.view = View::Actions;
+                                    t.run = Some(id);
+                                    t.job = None;
+                                    t.log_open = false;
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+            None => {}
+        }
+
+        // Contributors
+        let people = data.and_then(|d| d.contributors.data.as_ref());
+        body = body.child(self.brief_header(colors, "Contributors", people.map(|p| p.len()), View::Commits, cx));
+        if let Some(people) = people {
+            let mut grid = div().flex().flex_wrap().gap(px(6.)).pt_1();
+            for p in people.iter().take(24) {
+                let tip = format!("{} · {} commits", p.login, util::thousands(p.contributions));
+                let url = format!("https://github.com/{}", p.login);
+                grid = grid.child(
+                    div()
+                        .id(SharedString::from(format!("contrib-{}", p.login)))
+                        .cursor_pointer()
+                        .child(self.avatar(Some(&p.login), &p.login, 26., cx))
+                        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            body = body.child(grid);
+            if people.is_empty() {
+                body = body.child(label(colors, "GitHub hasn’t computed contributors yet"));
+            }
+        }
+        col()
+            .size_full()
+            .bg(rgb(colors.chrome))
+            .border_l_1()
+            .border_color(rgb(colors.border))
+            .child(
+                row()
+                    .h(px(BAR))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
+                    .child(icon(IconName::Info).text_color(rgb(colors.muted)))
+                    .child("About")
+                    .child(div().flex_1())
+                    .when_some(repo, |s, r| s.child(label(colors, r.slug()).truncate())),
+            )
+            .child(div().id("brief-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .into_any_element()
+    }
+    fn brief_header(&self, colors: Palette, title: &'static str, count: Option<usize>, view: View, cx: &mut Context<Self>) -> Stateful<Div> {
+        row()
+            .id(SharedString::from(format!("brief-{title}")))
+            .pt_4()
+            .pb_1()
+            .gap_2()
+            .text_size(px(12.))
+            .text_color(rgb(colors.muted))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|s| s.text_color(rgb(colors.text)))
+            .child(title)
+            .when_some(count.filter(|c| *c > 0), |s, c| s.child(count_badge(colors, c)))
+            .child(div().flex_1().h(px(1.)).bg(rgb(colors.border)))
+            .child(icon(IconName::ChevronRight).size(px(12.)))
+            .on_click(cx.listener(move |s, _, _, cx| s.set_view(view, cx)))
+    }
+
+    fn status(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let tab = self.current();
+        let repo = tab.and_then(|t| self.repo(&t.repo));
+        let branch = tab.and_then(|t| match t.view {
+            View::Commits if repo.is_some_and(|r| r.path.is_some()) => {
+                Some(t.graph_ref.clone().unwrap_or_else(|| "all branches".into()))
+            }
+            _ => self.branch_of(t),
+        });
+        let signed_in = self.user.data.is_some();
+        row()
+            .h(px(28.))
+            .flex_shrink_0()
+            .px_1()
+            .gap(px(2.))
+            .bg(rgb(colors.chrome))
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .text_size(px(12.))
+            .text_color(rgb(colors.muted))
+            .child(
+                toggle(colors, "sidebar-toggle", IconName::PanelLeft, "Toggle sidebar · ⌘ B", self.sidebar)
+                    .on_click(cx.listener(|s, _, w, cx| s.toggle_sidebar(&ToggleSidebar, w, cx))),
+            )
+            .child(
+                toggle(colors, "brief-toggle", IconName::PanelRight, "Toggle brief · ⌘ ⌥ B", self.brief)
+                    .on_click(cx.listener(|s, _, w, cx| s.toggle_brief(&ToggleBrief, w, cx))),
+            )
+            .child(divider(colors))
+            .child(
+                row()
+                    .gap(px(6.))
+                    .px_1()
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(if signed_in {
+                        colors.green
+                    } else if self.user.loading {
+                        colors.amber
+                    } else {
+                        colors.red
+                    })))
+                    .child(match &self.user.data {
+                        Some(u) => u.login.clone(),
+                        None if self.user.loading => "Connecting to gh…".into(),
+                        None => "gh not signed in".into(),
+                    }),
+            )
+            .when_some(repo, |s, r| {
+                s.child(div().text_color(rgb(colors.quiet)).child("·"))
+                    .child(div().px_1().child(r.slug()))
+            })
+            .when_some(branch, |s, b| {
+                s.child(
+                    row()
+                        .gap(px(4.))
+                        .px_1()
+                        .child(icon(Glyph::Branch).size(px(12.)))
+                        .child(b),
+                )
+            })
+            .child(div().flex_1())
+            .when_some(self.busy.clone(), |s, b| {
+                s.child(row().gap(px(6.)).px_2().child(spinner(colors)).child(b))
+            })
+            .child(div().px_2().child(match settings::get(cx).refresh_secs {
+                0 => "Auto-refresh off".to_string(),
+                n if n < 60 => format!("Refresh every {n}s"),
+                n => format!("Refresh every {}m", n / 60),
+            }))
+            .into_any_element()
+    }
+
+    fn welcome(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let action = |id: &'static str, glyph: Icon, title: &'static str, keys: Option<&str>| {
+            row()
+                .id(id)
+                .h(px(32.))
+                .px_2()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(colors.hover)))
+                .child(glyph.size(px(15.)).text_color(rgb(colors.muted)))
+                .child(div().flex_1().child(title))
+                .when_some(keys, |s, k| s.child(kbd(k)))
+        };
+        let signed_out = self.user.error.clone();
+        col()
+            .size_full()
+            .justify_center()
+            .items_center()
+            .bg(rgb(colors.background))
+            .child(
+                col()
+                    .w(px(420.))
+                    .gap_5()
+                    .child(
+                        row()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(9.))
+                                    .bg(rgb(colors.blue_tint))
+                                    .child(icon(Glyph::Graph).size(px(22.)).text_color(rgb(colors.blue))),
+                            )
+                            .child(
+                                col()
+                                    .gap(px(2.))
+                                    .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Gitflow"))
+                                    .child(label(colors, "A GitHub workspace on the gh CLI")),
+                            ),
+                    )
+                    .child(div().text_color(rgb(colors.muted)).line_height(relative(1.55)).child(
+                        if self.repos.is_empty() {
+                            "Add a repository to browse its code, follow the commit graph, review pull requests and run workflows."
+                        } else {
+                            "Pick a repository from the sidebar. ⌘-click opens another tab; each tab keeps its own view and selection."
+                        },
+                    ))
+                    .when_some(signed_out, |s, e| {
+                        s.child(
+                            row()
+                                .gap_2()
+                                .items_start()
+                                .p_3()
+                                .rounded(px(8.))
+                                .bg(rgb(colors.amber_tint))
+                                .child(icon(IconName::TriangleAlert).text_color(rgb(colors.amber)))
+                                .child(div().flex_1().text_size(px(13.)).line_height(relative(1.45)).child(e)),
+                        )
+                    })
+                    .child(
+                        col()
+                            .gap(px(2.))
+                            .child(label(colors, "Get started").px_2().pb_1())
+                            .child(
+                                action("welcome-local", Glyph::FolderGit.into(), "Add local repository…", Some("cmd-o"))
+                                    .on_click(cx.listener(|s, _, w, cx| s.add_local(&AddLocal, w, cx))),
+                            )
+                            .child(
+                                action("welcome-url", Glyph::Link.into(), "Add from GitHub URL…", Some("cmd-shift-o"))
+                                    .on_click(cx.listener(|s, _, w, cx| s.open_add_url(&AddUrl, w, cx))),
+                            )
+                            .child(
+                                action("welcome-prefs", IconName::Settings.into(), "Preferences", Some("cmd-,"))
+                                    .on_click(cx.listener(|s, _, w, cx| s.open_prefs(&OpenPreferences, w, cx))),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn add_url_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .justify_center()
+            .pt(px(120.))
+            .bg(rgba(colors.scrim))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|s, _, _, cx| {
+                    s.add_url_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                col()
+                    .w(px(520.))
+                    .h_auto()
+                    .bg(rgb(colors.background))
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .rounded(px(10.))
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        row()
+                            .h(px(BAR + 6.))
+                            .px_4()
+                            .gap_2()
+                            .bg(rgb(colors.chrome))
+                            .border_b_1()
+                            .border_color(rgb(colors.border))
+                            .child(icon(Glyph::Link).text_color(rgb(colors.muted)))
+                            .child(div().flex_1().font_weight(FontWeight::MEDIUM).child("Add repository from GitHub"))
+                            .child(label(colors, "esc")),
+                    )
+                    .child(
+                        col()
+                            .p_4()
+                            .gap_3()
+                            .child(Input::new(&self.url_input).prefix(icon(IconName::GitHub).text_color(rgb(colors.muted))))
+                            .child(
+                                row()
+                                    .gap_2()
+                                    .child(label(colors, "Any repository your gh account can read. Link a clone later for the full graph."))
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("add-url-submit")
+                                            .label("Add")
+                                            .primary()
+                                            .small()
+                                            .loading(self.adding)
+                                            .disabled(self.adding)
+                                            .on_click(cx.listener(|s, _, w, cx| s.submit_url(w, cx))),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn notice_view(&self, notice: &Notice, cx: &mut Context<Self>) -> AnyElement {
+        let colors = palette(cx);
+        let (fg, bg) = if notice.ok {
+            (colors.green, colors.green_tint)
+        } else {
+            (colors.amber, colors.amber_tint)
+        };
+        row()
+            .absolute()
+            .bottom(px(40.))
+            .right(px(16.))
+            .w(px(440.))
+            .pl_3()
+            .pr_1()
+            .py_2()
+            .gap_2()
+            .items_start()
+            .bg(rgb(bg))
+            .border_1()
+            .border_color(rgb(colors.border))
+            .rounded(px(8.))
+            .shadow_md()
+            .child(
+                div().pt(px(2.)).child(
+                    icon(if notice.ok { IconName::CircleCheck } else { IconName::TriangleAlert }).text_color(rgb(fg)),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pt(px(1.))
+                    .text_size(px(13.))
+                    .line_height(relative(1.45))
+                    .child(notice.text.clone()),
+            )
+            .child(
+                icon_button("dismiss-notice", IconName::Close, "Dismiss")
+                    .xsmall()
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.notice = None;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(t) = self.current() else {
+            return div().into_any_element();
+        };
+        match t.view {
+            View::Code => self.code_view(window, cx),
+            View::Commits => self.commits_view(window, cx),
+            View::Pulls => self.pulls_view(window, cx),
+            View::Actions => self.actions_view(window, cx),
+            View::Releases => self.releases_view(window, cx),
+        }
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure(false, cx);
+        if let Some(id) = self.pending_clear.take()
+            && let Some(t) = self.tabs.iter().find(|t| t.id == id)
+        {
+            t.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        let colors = palette(cx);
+        let center = if self.current().is_some() {
+            let view = self.content(window, cx);
+            let body = if self.brief {
+                h_resizable("brief-panels")
+                    .with_state(&self.brief_panels)
+                    .child(resizable_panel().size_range(px(420.)..Pixels::MAX).child(view))
+                    .child(
+                        resizable_panel()
+                            .size(px(300.))
+                            .size_range(px(240.)..px(480.))
+                            .child(self.brief_view(cx)),
+                    )
+                    .into_any_element()
+            } else {
+                view
+            };
+            col()
+                .size_full()
+                .min_w_0()
+                .child(self.tabs_view(cx))
+                .child(self.nav(cx))
+                .child(div().flex_1().min_h_0().child(body))
+                .into_any_element()
+        } else {
+            self.welcome(cx)
+        };
+        let main = if self.sidebar {
+            h_resizable("sidebar-panels")
+                .with_state(&self.sidebar_panels)
+                .child(
+                    resizable_panel()
+                        .size(px(250.))
+                        .size_range(px(190.)..px(400.))
+                        .child(self.sidebar_view(cx)),
+                )
+                .child(resizable_panel().size_range(px(480.)..Pixels::MAX).child(center))
+                .into_any_element()
+        } else {
+            center
+        };
+        let mut root = col()
+            .relative()
+            .size_full()
+            .bg(rgb(colors.background))
+            .text_color(rgb(colors.text))
+            .font_family(".SystemUIFont")
+            .text_size(px(13.))
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_brief))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::duplicate_tab))
+            .on_action(cx.listener(|s, _: &NextTab, _, cx| s.cycle(1, cx)))
+            .on_action(cx.listener(|s, _: &PreviousTab, _, cx| s.cycle(-1, cx)))
+            .on_action(cx.listener(Self::open_prefs))
+            .on_action(cx.listener(Self::add_local))
+            .on_action(cx.listener(Self::open_add_url))
+            .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(|s, _: &ShowCode, _, cx| s.set_view(View::Code, cx)))
+            .on_action(cx.listener(|s, _: &ShowCommits, _, cx| s.set_view(View::Commits, cx)))
+            .on_action(cx.listener(|s, _: &ShowPulls, _, cx| s.set_view(View::Pulls, cx)))
+            .on_action(cx.listener(|s, _: &ShowActions, _, cx| s.set_view(View::Actions, cx)))
+            .on_action(cx.listener(|s, _: &ShowReleases, _, cx| s.set_view(View::Releases, cx)))
+            .on_key_down(cx.listener(|s, e: &KeyDownEvent, w, cx| {
+                if e.keystroke.key != "escape" {
+                    return;
+                }
+                if s.popup.is_some() || s.add_url_open || s.prefs_open {
+                    s.popup = None;
+                    s.add_url_open = false;
+                    s.prefs_open = false;
+                    cx.notify();
+                } else if s.focus.is_focused(w) {
+                    s.back(&Back, w, cx);
+                }
+            }))
+            .child(self.title(cx))
+            .child(div().flex_1().min_h_0().child(main))
+            .child(self.status(cx));
+        if self.prefs_open {
+            root = root.child(self.preferences_view(cx));
+        } else if self.add_url_open {
+            root = root.child(self.add_url_view(cx));
+        }
+        if let Some(notice) = &self.notice {
+            root = root.child(self.notice_view(notice, cx));
+        }
+        if let Some(menu) = &self.popup {
+            root = root.child(
+                deferred(
+                    anchored()
+                        .position(self.popup_position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(2),
+            );
+        }
+        root
+    }
+}
