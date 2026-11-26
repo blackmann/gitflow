@@ -13,10 +13,9 @@ use gpui::prelude::FluentBuilder;
 use gpui_component::{
     Disableable,
     IconName, Sizable,
-    button::{Button, ButtonVariants},
+    button::Button,
     input::Input,
     resizable::*,
-    tooltip::Tooltip,
 };
 
 const COMMIT_ROW: f32 = 30.;
@@ -164,12 +163,16 @@ impl Workspace {
                         .on_click(cx.listener(|s, _, _, cx| s.fetch_local(cx))),
                 )
             });
-        let list = match (state(colors, l, "Reading history…"), loaded) {
+        let list = match (state(colors, l, "Reading history…"), loaded.clone()) {
             (Ok(()), Some(g)) => self.history(t, g, query, cx),
             (Err(p), _) => p.into_any_element(),
             _ => loading(colors, "Reading history…").into_any_element(),
         };
+        let in_history = |sha: &str| loaded.as_ref().is_some_and(|g| g.commits.iter().any(|c| c.sha == sha));
         let body = match t.commit.clone() {
+            // Opened from elsewhere (a pull request, a file's blame) and not in
+            // this history: the commit gets the whole page.
+            Some(sha) if loaded.is_some() && !in_history(&sha) => self.commit_detail(t, &sha, window, cx),
             Some(sha) => v_resizable(SharedString::from(format!("commit-split-{}", t.id)))
                 .child(resizable_panel().size_range(px(120.)..Pixels::MAX).child(list))
                 .child(
@@ -198,8 +201,6 @@ impl Workspace {
         let graph_w = paint::width(g.graph.lanes).clamp(GRAPH_MIN, GRAPH_MAX);
         let tab = t.id;
         let selected = t.commit.clone();
-        let mono = settings::mono(cx);
-        let mono_size = px(settings::get(cx).mono_size as f32);
         let header = row()
             .h(px(26.))
             .flex_shrink_0()
@@ -210,7 +211,7 @@ impl Workspace {
             .child(div().w(px(graph_w)).flex_shrink_0().pl_3().child("Graph"))
             .child(div().flex_1().px_2().child("Description"))
             .child(div().w(px(170.)).flex_shrink_0().px_2().child("Author"))
-            .child(div().w(px(84.)).flex_shrink_0().px_2().child("Commit"))
+            .child(div().w(px(104.)).flex_shrink_0().px_2().child("Commit"))
             .child(div().w(px(96.)).flex_shrink_0().px_2().child("Date"));
         let count = g.commits.len();
         let list = uniform_list(
@@ -282,14 +283,11 @@ impl Workspace {
                             )
                             .child(
                                 div()
-                                    .w(px(84.))
+                                    .w(px(104.))
                                     .flex_shrink_0()
                                     .px_2()
-                                    .font_family(mono.clone())
-                                    .text_size(mono_size)
-                                    .text_color(rgb(colors.muted))
                                     .when(dim, |s| s.opacity(0.3))
-                                    .child(util::short_sha(&c.sha).to_string()),
+                                    .child(s.sha_chip(format!("row-{i}"), &c.sha, cx)),
                             )
                             .child(
                                 div()
@@ -312,20 +310,24 @@ impl Workspace {
             }),
         )
         .track_scroll(t.list_scroll.clone())
-        .flex_1()
-        .min_h_0();
-        col().size_full().child(header).child(list).into_any_element()
+        .size_full();
+        col()
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().child(scrollbars(("history-scrollbar", tab), &t.list_scroll, ScrollbarAxis::Vertical, list)))
+            .into_any_element()
     }
 
-    fn commit_detail(&self, t: &Tab, sha: &str, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn commit_detail(&self, t: &Tab, sha: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let mono = settings::mono(cx);
+        let message_scroll = window.use_keyed_state("commit-message-scroll", cx, |_, _| ScrollHandle::new()).read(cx).clone();
+        let l = self.data(&t.repo).and_then(|d| d.commit.get(sha));
+        let info = l.and_then(|l| l.data.clone());
         let commit = self
             .graph_key(t)
             .and_then(|k| self.data(&t.repo)?.commits.get(&k)?.data.clone())
-            .and_then(|g| g.commits.iter().find(|c| c.sha == sha).cloned());
-        let l = self.data(&t.repo).and_then(|d| d.commit.get(sha));
-        let info = l.and_then(|l| l.data.clone());
+            .and_then(|g| g.commits.iter().find(|c| c.sha == sha).cloned())
+            .or_else(|| info.as_ref().and_then(|i| i.meta.clone()));
         let message = info.as_ref().map(|i| i.message.clone());
         let title = message
             .as_deref()
@@ -353,15 +355,7 @@ impl Workspace {
                     .gap_2()
                     .child(icon(Glyph::Commit).text_color(rgb(colors.muted)))
                     .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(
-                        Button::new("copy-sha")
-                            .label(util::short_sha(sha).to_string())
-                            .icon(IconName::Copy)
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Copy full SHA")
-                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(full.clone()))),
-                    )
+                    .child(self.sha_chip("detail", &full, cx))
                     .child(icon_button("close-commit", IconName::Close, "Close · esc").xsmall().on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) {
                             t.commit = None;
@@ -381,35 +375,26 @@ impl Workspace {
                         .when(!parents.is_empty(), |s| {
                             s.child(div().text_color(rgb(colors.quiet)).child("·")).child(if parents.len() > 1 { "parents" } else { "parent" })
                         })
-                        .children(parents.iter().map(|p| {
-                            let p2 = p.clone();
-                            div()
-                                .id(SharedString::from(format!("parent-{p}")))
-                                .font_family(mono.clone())
-                                .text_color(rgb(colors.blue))
-                                .cursor_pointer()
-                                .child(util::short_sha(p).to_string())
-                                .tooltip(|w, cx| Tooltip::new("Select parent").build(w, cx))
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) {
-                                        t.commit = Some(p2.clone());
-                                    }
-                                    cx.notify();
-                                }))
-                        })),
+                        .children(parents.iter().map(|p| self.sha_chip(format!("parent-{p}"), p, cx))),
                 )
             })
             .when(!rest.is_empty(), |s| {
                 s.child(
                     div()
-                        .max_h(px(120.))
-                        .id("commit-message")
-                        .overflow_y_scroll()
-                        .text_size(px(12.5))
-                        .line_height(relative(1.5))
-                        .text_color(rgb(colors.muted))
-                        .whitespace_normal()
-                        .child(rest),
+                        .relative()
+                        .child(
+                            div()
+                                .max_h(px(120.))
+                                .id("commit-message")
+                                .overflow_y_scroll()
+                                .track_scroll(&message_scroll)
+                                .text_size(px(12.5))
+                                .line_height(relative(1.5))
+                                .text_color(rgb(colors.muted))
+                                .whitespace_normal()
+                                .child(rest),
+                        )
+                        .child(scrollbar_layer("commit-message-scrollbar", &message_scroll, ScrollbarAxis::Vertical)),
                 )
             });
         let body = match (l, info) {
@@ -439,7 +424,7 @@ impl Workspace {
                                     .child(div().flex_1().min_h_0().child(self.diff_files(colors, &diff, t.diff_scroll.clone(), cx))),
                             ),
                     )
-                    .child(resizable_panel().child(self.diff_list(("commit-diff", t.id), diff, t.diff_scroll.clone(), None, cx)))
+                    .child(resizable_panel().child(self.diff_list(("commit-diff", t.id), diff, t.diff_scroll.clone(), t.x_scroll.clone(), None, cx)))
                     .into_any_element()
             }
             (Some(Load { error: Some(e), .. }), _) => failed(colors, e).into_any_element(),

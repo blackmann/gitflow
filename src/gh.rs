@@ -482,7 +482,7 @@ pub fn folder_info(slug: &str, branch: &str, paths: &[String]) -> Result<FolderI
             "-L",
             "10",
             "--json",
-            "databaseId,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt,updatedAt,startedAt,number,url",
+            "databaseId,displayTitle,status,conclusion,workflowName,headBranch,event,createdAt,updatedAt,startedAt,number,url,headSha",
         ])
         .ok()
         .and_then(|t| json::<Vec<Run>>(&t).ok())
@@ -752,30 +752,51 @@ pub fn origin_url(path: &Path) -> Result<String> {
 pub struct CommitDetail {
     pub message: String,
     pub files: Vec<FileDiff>,
+    /// Author, date and parents, for commits opened outside the loaded history.
+    pub meta: Option<Commit>,
 }
 pub fn commit_detail(slug: &str, path: Option<&Path>, sha: &str) -> Result<CommitDetail> {
     if let Some(path) = path
-        && let Ok(message) = git(path, &["log", "-1", "--format=%B", sha])
+        && let Ok(out) = git(path, &["log", "-1", "--format=%H%x00%P%x00%an%x00%at%x00%B", sha])
     {
+        let mut parts = out.splitn(5, '\0');
+        let mut next = || parts.next().unwrap_or("").to_string();
+        let (full, parents, author, time, message) = (next(), next(), next(), next(), next());
         let diff = git(path, &["show", "--format=", "--patch", "-M", "--no-color", sha])?;
+        let message = message.trim_end().to_string();
         return Ok(CommitDetail {
-            message: message.trim_end().to_string(),
+            meta: Some(Commit {
+                sha: full.trim().to_string(),
+                parents: parents.split_whitespace().map(String::from).collect(),
+                author,
+                login: None,
+                time: time.trim().parse().unwrap_or(0),
+                subject: message.lines().next().unwrap_or("").to_string(),
+                refs: vec![],
+            }),
+            message,
             files: parse_diff(&diff),
         });
     }
-    #[derive(Deserialize)]
-    struct Body {
-        commit: ApiCommitBody,
-    }
-    let body: Body = json(&gh(&["api", &format!("repos/{slug}/commits/{sha}")])?)?;
+    let c: ApiCommit = json(&gh(&["api", &format!("repos/{slug}/commits/{sha}")])?)?;
     let diff = gh(&[
         "api",
         "-H",
         "Accept: application/vnd.github.diff",
         &format!("repos/{slug}/commits/{sha}"),
     ])?;
+    let message = c.commit.message.trim_end().to_string();
     Ok(CommitDetail {
-        message: body.commit.message.trim_end().to_string(),
+        meta: Some(Commit {
+            sha: c.sha,
+            parents: c.parents.into_iter().map(|p| p.sha).collect(),
+            author: c.commit.author.name,
+            login: c.author.map(|a| a.login).filter(|l| !l.is_empty()),
+            time: crate::util::parse_time(&c.commit.author.date),
+            subject: message.lines().next().unwrap_or("").to_string(),
+            refs: vec![],
+        }),
+        message,
         files: parse_diff(&diff),
     })
 }
@@ -1348,6 +1369,8 @@ pub struct Run {
     pub number: u64,
     #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub head_sha: String,
 }
 impl Run {
     pub fn active(&self) -> bool {
@@ -1433,6 +1456,59 @@ pub fn workflows(slug: &str) -> Result<Vec<Workflow>> {
 /// Whether a workflow file lists `workflow_dispatch` among its triggers, in any
 /// of YAML's forms (`on: workflow_dispatch`, a list, or a mapping key).
 /// Comments are ignored.
+/// A job as its workflow file declares it: the key under `jobs:`, its `name:`
+/// (which may hold `${{ }}` expressions), and the jobs it waits on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlannedJob {
+    pub id: String,
+    pub name: Option<String>,
+    pub needs: Vec<String>,
+}
+/// The jobs of a workflow file, in the order written. Malformed YAML has none.
+pub fn planned_jobs(yaml: &str) -> Vec<PlannedJob> {
+    use serde_yaml::Value;
+    let Ok(doc) = serde_yaml::from_str::<Value>(yaml) else { return vec![] };
+    let Some(jobs) = doc.get("jobs").and_then(Value::as_mapping) else { return vec![] };
+    jobs.iter()
+        .filter_map(|(id, job)| {
+            let needs = match job.get("needs") {
+                Some(Value::String(s)) => vec![s.clone()],
+                Some(Value::Sequence(list)) => list.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                _ => vec![],
+            };
+            Some(PlannedJob {
+                id: id.as_str()?.to_string(),
+                name: job.get("name").and_then(Value::as_str).map(String::from),
+                needs,
+            })
+        })
+        .collect()
+}
+/// The jobs the run's workflow file declares, read at the run's commit, for
+/// the run graph. Dynamic workflows (Pages, Dependabot…) have no file: empty.
+pub fn run_plan(slug: &str, run: u64) -> Result<Vec<PlannedJob>> {
+    #[derive(Deserialize)]
+    struct RunFile {
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        head_sha: String,
+    }
+    let r: RunFile = json(&gh(&["api", &format!("repos/{slug}/actions/runs/{run}")])?)?;
+    // Reusable workflow paths may carry their ref: `.github/workflows/ci.yml@main`.
+    let path = r.path.split('@').next().unwrap_or("");
+    if !path.starts_with(".github/workflows/") || r.head_sha.is_empty() {
+        return Ok(vec![]);
+    }
+    let yaml = gh(&[
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw",
+        &contents_url(slug, path, &r.head_sha),
+    ])?;
+    Ok(planned_jobs(&yaml))
+}
+
 pub fn declares_dispatch(yaml: &str) -> bool {
     yaml.lines().any(|line| {
         let code = line.split('#').next().unwrap_or("");

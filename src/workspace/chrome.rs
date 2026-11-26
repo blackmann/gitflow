@@ -323,7 +323,7 @@ impl Workspace {
                         .cleanable(true),
                 ),
             )
-            .child(div().id("repo-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+            .child(div().id("repo-list").flex_1().min_h_0().overflow_y_scrollbar().child(list))
             .child(
                 row()
                     .h(px(BAR + 4.))
@@ -524,7 +524,10 @@ impl Workspace {
                 .border_b_1()
                 .border_color(rgb(colors.border))
         };
-        let many = self.tabs.len() > 1;
+        let (can_back, can_forward) = self
+            .current()
+            .map(|t| (t.history.can_back(), t.history.can_forward()))
+            .unwrap_or_default();
         row()
             .h(px(BAR))
             .flex_shrink_0()
@@ -532,16 +535,8 @@ impl Workspace {
             .child(
                 edge()
                     .border_r_1()
-                    .child(
-                        icon_button("prev-tab", IconName::ArrowLeft, "Previous tab · ⌘ ⇧ [")
-                            .disabled(!many)
-                            .on_click(cx.listener(|s, _, _, cx| s.cycle(-1, cx))),
-                    )
-                    .child(
-                        icon_button("next-tab", IconName::ArrowRight, "Next tab · ⌘ ⇧ ]")
-                            .disabled(!many)
-                            .on_click(cx.listener(|s, _, _, cx| s.cycle(1, cx))),
-                    ),
+                    .child(self.history_button(false, can_back, cx))
+                    .child(self.history_button(true, can_forward, cx)),
             )
             .child(div().min_w_0().h_full().child(tabs))
             .child(div().flex_1().h_full().border_b_1().border_color(rgb(colors.border)))
@@ -555,6 +550,109 @@ impl Workspace {
                     .child(new_tab),
             )
             .into_any_element()
+    }
+
+    /// Open the active tab's local clone in an installed editor, or Finder.
+    fn open_with_button(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let path = self.current().and_then(|t| self.repo(&t.repo)).and_then(|r| r.path.clone())?;
+        let first = self.editors.list.iter().find(|e| e.folders);
+        // The first editor's own icon leads the label, as in Chat's file header.
+        let lead = match first.and_then(|e| e.icon.clone()) {
+            Some(png) => img(png).size(px(14.)).flex_shrink_0().into_any_element(),
+            None => icon(IconName::ExternalLink).size(px(14.)).into_any_element(),
+        };
+        let trigger = Button::new("open-with-trigger")
+            .ghost()
+            .small()
+            .dropdown_caret(true)
+            .tooltip("Open this clone in an editor")
+            .child(row().gap(px(6.)).child(lead).child("Open with"));
+        Some(self.popover_button("open-with", trigger, None, 240., move |s, _, _| {
+            use crate::editors;
+            let mut out: Vec<Entry> = s
+                .editors
+                .list
+                .iter()
+                .filter(|e| e.folders)
+                .map(|e| {
+                    let (app, target) = (e.app.clone(), path.clone());
+                    let item = Item::new(e.name.clone()).on_click(move |_, _| editors::open(&app, &target));
+                    Entry::Item(match &e.icon {
+                        Some(png) => item.image(png.clone()),
+                        None => item.icon(IconName::ExternalLink),
+                    })
+                })
+                .collect();
+            if out.is_empty() {
+                out.push(Entry::Item(Item::new("No editors found").disabled(true)));
+            }
+            out.push(Entry::Separator);
+            let target = path.clone();
+            let reveal = Item::new("Reveal in Finder").on_click(move |_, cx| cx.reveal_path(&target));
+            out.push(Entry::Item(match &s.editors.finder {
+                Some(png) => reveal.image(png.clone()),
+                None => reveal.icon(IconName::FolderOpen),
+            }));
+            let terminal = std::path::PathBuf::from("/System/Applications/Utilities/Terminal.app");
+            if terminal.is_dir() {
+                let target = path.clone();
+                out.push(Entry::Item(
+                    Item::new("Open in Terminal").icon(IconName::SquareTerminal).on_click(move |_, _| editors::open(&terminal, &target)),
+                ));
+            }
+            out
+        }, cx))
+    }
+
+    /// Back or forward through the tab's history. Right-click lists the places.
+    fn history_button(&self, forward: bool, enabled: bool, cx: &mut Context<Self>) -> Div {
+        let (id, glyph, tip) = if forward {
+            ("history-forward", IconName::ArrowRight, "Forward · ⌘ ]  ·  right-click for history")
+        } else {
+            ("history-back", IconName::ArrowLeft, "Back · ⌘ [  ·  right-click for history")
+        };
+        let step = if forward { 1 } else { -1 };
+        self.anchor(
+            id,
+            icon_button(id, glyph, tip)
+                .disabled(!enabled)
+                .on_click(cx.listener(move |s, _, _, cx| s.go(step, cx))),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                cx.stop_propagation();
+                s.history_menu(forward, e.position, w, cx);
+            }),
+        )
+    }
+    fn history_menu(&mut self, forward: bool, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        self.open_popover(
+            if forward { "history-forward-menu" } else { "history-back-menu" },
+            position,
+            None,
+            260.,
+            Rc::new(move |cx| {
+                let Some(w) = weak.upgrade() else { return vec![] };
+                let Some(t) = w.read(cx).current() else { return vec![] };
+                let places: Vec<_> = if forward { t.history.forward_list().collect() } else { t.history.back_list().collect() };
+                places
+                    .into_iter()
+                    .take(20)
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let weak = weak.clone();
+                        let steps = (i + 1) as isize * if forward { 1 } else { -1 };
+                        Entry::Item(Item::new(p.label()).icon(view_glyph(p.view)).on_click(move |_, cx| {
+                            let _ = weak.update(cx, |s, cx| s.go(steps, cx));
+                        }))
+                    })
+                    .collect()
+            }),
+            window,
+            cx,
+        );
     }
 
     /// The repository's view switcher: Code, Commits, Pull requests, Actions, Releases.
@@ -625,6 +723,7 @@ impl Workspace {
             .border_color(rgb(colors.border))
             .child(nav)
             .child(div().flex_1())
+            .children(self.open_with_button(cx))
             .when_some(url, |s, url| {
                 let page = match t.view {
                     View::Code => String::new(),
@@ -872,14 +971,13 @@ impl Workspace {
             .bg(rgb(colors.chrome))
             .border_l_1()
             .border_color(rgb(colors.border))
-            .child(div().id("brief-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .child(div().id("brief-scroll").flex_1().min_h_0().overflow_y_scrollbar().child(body))
             .into_any_element()
     }
     /// Commits per day for the last 30 days as a heat strip: grey for days without
     /// commits, deepening shades of green for busier ones. Hovering opens a popover
     /// docked under the strip; its arrow tracks the hovered day.
     fn activity_strip(&self, colors: Palette, data: Option<&RepoData>, cx: &mut Context<Self>) -> Div {
-        let mono = settings::mono(cx);
         let l = data.map(|d| &d.activity);
         let Some(act) = l.and_then(|l| l.data.clone()) else {
             return row()
@@ -995,14 +1093,7 @@ impl Workspace {
                             .w_full()
                             .gap_2()
                             .text_size(px(12.))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .font_family(mono.clone())
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(colors.muted))
-                                    .child(util::short_sha(&c.sha).to_string()),
-                            )
+                            .child(self.sha_chip(format!("brief-{}", c.sha), &c.sha, cx))
                             .child(div().flex_1().min_w_0().truncate().child(c.subject.clone()))
                     }))
                     .when(n > 3, |s| s.child(div().text_size(px(11.5)).text_color(rgb(colors.quiet)).child(format!("and {} more", n - 3)))),
@@ -1344,6 +1435,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.record_history();
         self.ensure(false, cx);
         if let Some(id) = self.pending_clear.take()
             && let Some(t) = self.tabs.iter().find(|t| t.id == id)
@@ -1416,6 +1508,17 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_add_url))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(|s, _: &GoBack, _, cx| s.go(-1, cx)))
+            .on_action(cx.listener(|s, _: &GoForward, _, cx| s.go(1, cx)))
+            // The mouse's side buttons step through history too.
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|s, _, _, cx| s.go(-1, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|s, _, _, cx| s.go(1, cx)),
+            )
             .on_action(cx.listener(|s, _: &ShowCode, _, cx| s.set_view(View::Code, cx)))
             .on_action(cx.listener(|s, _: &ShowCommits, _, cx| s.set_view(View::Commits, cx)))
             .on_action(cx.listener(|s, _: &ShowPulls, _, cx| s.set_view(View::Pulls, cx)))

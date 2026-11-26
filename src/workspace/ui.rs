@@ -11,12 +11,37 @@ use gpui_component::{
     Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     kbd::Kbd,
+    scroll::{Scrollbar, ScrollbarHandle},
     spinner::Spinner,
 };
+
+pub use gpui_component::scroll::{ScrollableElement, ScrollbarAxis};
 
 /// Shared layout rhythm: tab strip, nav bar and panel headers line up.
 pub const BAR: f32 = 34.;
 pub const ROW: f32 = 28.;
+
+/// Overlays a scrollbar on `content`, a scroll container that tracks `handle`.
+/// The overlay fills the wrapper, so size the wrapper like the container.
+pub fn scrollbars<H: ScrollbarHandle + Clone>(
+    id: impl Into<ElementId>,
+    handle: &H,
+    axis: impl Into<ScrollbarAxis>,
+    content: impl IntoElement,
+) -> Div {
+    div().relative().size_full().child(content).child(scrollbar_layer(id, handle, axis))
+}
+
+/// A bare scrollbar overlay, for wrappers that are already `relative()`.
+pub fn scrollbar_layer<H: ScrollbarHandle + Clone>(id: impl Into<ElementId>, handle: &H, axis: impl Into<ScrollbarAxis>) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .child(Scrollbar::new(handle).id(id).axis(axis))
+}
 
 pub fn row() -> Div {
     div().flex().items_center()
@@ -310,6 +335,75 @@ impl Workspace {
                 s.open_popover(id, e.position(), search, width, build.clone(), w, cx)
             })),
         )
+    }
+    /// A commit hash on a chip: the short hash opens the commit's changes, the
+    /// icon beside it copies the full hash. `id` keeps chips in a list apart.
+    pub(super) fn sha_chip(&self, id: impl Into<SharedString>, sha: &str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let colors = palette(cx);
+        let mono = settings::mono(cx);
+        let id: SharedString = id.into();
+        let copied = self.copied.as_ref().is_some_and(|(c, at)| c == sha && at.elapsed() < Duration::from_millis(1500));
+        let (open, copy) = (sha.to_string(), sha.to_string());
+        row()
+            .id(SharedString::from(format!("sha-{id}")))
+            .flex_shrink_0()
+            .h(px(20.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.chrome))
+            .overflow_hidden()
+            .text_size(px(11.5))
+            .text_color(rgb(colors.muted))
+            .child(
+                div()
+                    .id(SharedString::from(format!("sha-open-{id}")))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px(px(6.))
+                    .font_family(mono)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(colors.hover)).text_color(rgb(colors.blue)))
+                    .child(util::short_sha(sha).to_string())
+                    .tooltip(|w, cx| gpui_component::tooltip::Tooltip::new("Show this commit").build(w, cx))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        cx.stop_propagation();
+                        s.open_commit(open.clone(), cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("sha-copy-{id}")))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px(px(4.))
+                    .border_l_1()
+                    .border_color(rgb(colors.border))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
+                    .child(if copied {
+                        icon(IconName::Check).size(px(11.)).text_color(rgb(colors.green))
+                    } else {
+                        icon(IconName::Copy).size(px(11.))
+                    })
+                    .tooltip(|w, cx| gpui_component::tooltip::Tooltip::new("Copy full SHA").build(w, cx))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        s.copied = Some((copy.clone(), Instant::now()));
+                        cx.notify();
+                    })),
+            )
+    }
+    /// Show a commit's message, files and diff in this tab's Commits view.
+    pub(super) fn open_commit(&mut self, sha: String, cx: &mut Context<Self>) {
+        if let Some(t) = self.current_mut() {
+            t.view = View::Commits;
+            t.commit = Some(sha);
+        }
+        cx.notify();
     }
     pub(super) fn when(&self, ts: i64, cx: &App) -> String {
         util::when(ts, settings::get(cx).relative_dates)

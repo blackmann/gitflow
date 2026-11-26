@@ -9,6 +9,7 @@ use gpui::*;
 use gpui_component::{
     Icon, IconName, Sizable,
     input::{self, Input, InputState},
+    scroll::{Scrollbar, ScrollbarAxis},
 };
 use std::rc::Rc;
 
@@ -18,6 +19,7 @@ pub struct Item {
     label: SharedString,
     detail: Option<SharedString>,
     icon: Option<Icon>,
+    image: Option<std::path::PathBuf>,
     checked: bool,
     disabled: bool,
     keep_open: bool,
@@ -30,6 +32,7 @@ impl Item {
             label: label.into(),
             detail: None,
             icon: None,
+            image: None,
             checked: false,
             disabled: false,
             keep_open: false,
@@ -43,6 +46,11 @@ impl Item {
     }
     pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+    /// Show a picture, such as an app's icon, where the icon goes.
+    pub fn image(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.image = Some(path.into());
         self
     }
     pub fn checked(mut self, checked: bool) -> Self {
@@ -274,6 +282,7 @@ impl Render for Menu {
                                 }))
                                 .on_click(cx.listener(move |m, _, w, cx| m.activate(i, w, cx)))
                         })
+                        .when_some(item.image, |s, path| s.child(img(path).flex_shrink_0().size(px(16.))))
                         .when_some(item.icon, |s, icon| {
                             s.child(icon.size(px(14.)).text_color(rgb(colors.muted)))
                         })
@@ -363,6 +372,16 @@ impl Render for Menu {
                         .child(Input::new(&search).appearance(false).small()),
                 )
             })
-            .child(list)
+            .child(
+                div().relative().child(list).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(Scrollbar::new(&self.scroll).id("menu-scrollbar").axis(ScrollbarAxis::Vertical)),
+                ),
+            )
     }
 }

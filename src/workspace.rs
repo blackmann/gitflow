@@ -21,11 +21,13 @@ mod chrome;
 mod code;
 mod commits;
 mod diff;
+mod history;
 mod md;
 mod syntax;
 mod preferences;
 mod pulls;
 mod releases;
+mod run_graph;
 mod ui;
 
 actions!(
@@ -48,6 +50,8 @@ actions!(
         ShowReleases,
         Submit,
         Back,
+        GoBack,
+        GoForward,
         Quit
     ]
 );
@@ -132,6 +136,7 @@ impl DiffView {
 }
 pub struct CommitInfo {
     pub message: String,
+    pub meta: Option<gh::Commit>,
     pub diff: Arc<DiffView>,
 }
 /// A job log with a header row wherever the step changes.
@@ -164,6 +169,8 @@ pub struct RepoData {
     pub blob: HashMap<(String, String), Load<Arc<BlobView>>>,
     pub blame: HashMap<(String, String), Load<Arc<gh::Blame>>>,
     pub jobs: HashMap<u64, Load<Vec<gh::Job>>>,
+    /// Each run's jobs as its workflow file declares them, for the run graph.
+    pub plan: HashMap<u64, Load<Arc<Vec<gh::PlannedJob>>>>,
     pub log: HashMap<u64, Load<Arc<LogView>>>,
 }
 
@@ -197,19 +204,8 @@ struct Session {
 #[serde(default)]
 struct SavedTab {
     repo: String,
-    view: View,
-    branch: Option<String>,
-    graph_ref: Option<String>,
-    path: String,
-    file: Option<String>,
-    commit: Option<String>,
-    pr_filter: PrFilter,
-    pr: Option<u64>,
-    pr_page: PrPage,
-    workflow: Option<u64>,
-    run: Option<u64>,
-    job: Option<u64>,
-    log_open: bool,
+    #[serde(flatten)]
+    place: history::Place,
 }
 impl Session {
     const FILE: &str = "session.json";
@@ -229,34 +225,8 @@ impl SavedTab {
     fn of(t: &Tab) -> Self {
         Self {
             repo: t.repo.clone(),
-            view: t.view,
-            branch: t.branch.clone(),
-            graph_ref: t.graph_ref.clone(),
-            path: t.path.clone(),
-            file: t.file.clone(),
-            commit: t.commit.clone(),
-            pr_filter: t.pr_filter,
-            pr: t.pr,
-            pr_page: t.pr_page,
-            workflow: t.workflow,
-            run: t.run,
-            job: t.job,
-            log_open: t.log_open,
+            place: history::Place::of(t),
         }
-    }
-    fn apply(self, t: &mut Tab) {
-        t.branch = self.branch;
-        t.graph_ref = self.graph_ref;
-        t.path = self.path;
-        t.file = self.file;
-        t.commit = self.commit;
-        t.pr_filter = self.pr_filter;
-        t.pr = self.pr;
-        t.pr_page = self.pr_page;
-        t.workflow = self.workflow;
-        t.run = self.run;
-        t.job = self.job;
-        t.log_open = self.log_open;
     }
 }
 
@@ -292,7 +262,10 @@ pub struct Tab {
     pub diff_scroll: UniformListScrollHandle,
     pub log_scroll: UniformListScrollHandle,
     pub page_scroll: ScrollHandle,
+    /// The sideways scroller around wide line lists (file, diff, job log).
+    pub x_scroll: ScrollHandle,
     pub release_list: ListState,
+    pub history: history::History,
 }
 
 struct Notice {
@@ -371,6 +344,16 @@ pub struct Workspace {
     session: Option<Session>,
     /// The first row a diff list last drew, so its pinned file header keeps up.
     diff_top: usize,
+    /// The hash last copied from a commit chip, which shows a check for a moment.
+    copied: Option<(String, Instant)>,
+    /// A drag panning the run graph, and when it last moved the view.
+    pan: Option<run_graph::Pan>,
+    panned: Option<Instant>,
+    /// Each run graph's pan, and the last graph's size and view for limiting it.
+    graph_offsets: HashMap<u64, Point<Pixels>>,
+    graph_extent: Rc<std::cell::Cell<(Size<Pixels>, Size<Pixels>)>>,
+    /// Editors a local clone can be opened in, found off the main thread at launch.
+    editors: Rc<crate::editors::Editors>,
     focus: FocusHandle,
 }
 
@@ -439,6 +422,12 @@ impl Workspace {
             tick: 0,
             session: None,
             diff_top: 0,
+            copied: None,
+            pan: None,
+            panned: None,
+            graph_offsets: HashMap::new(),
+            graph_extent: Rc::default(),
+            editors: Rc::default(),
             focus,
         };
         // Markdown views load images through the same cache as avatars.
@@ -450,6 +439,14 @@ impl Workspace {
         {
             s.open_repo(&first, window, cx);
         }
+        cx.spawn(async move |this, cx| {
+            let editors = cx.background_executor().spawn(async { crate::editors::load() }).await;
+            let _ = this.update(cx, |s, cx| {
+                s.editors = Rc::new(editors);
+                cx.notify();
+            });
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 smol::Timer::after(Duration::from_millis(250)).await;
@@ -516,7 +513,9 @@ impl Workspace {
             diff_scroll: UniformListScrollHandle::new(),
             log_scroll: UniformListScrollHandle::new(),
             page_scroll: ScrollHandle::new(),
+            x_scroll: ScrollHandle::new(),
             release_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            history: history::History::default(),
         }
     }
     /// Focus the repository's existing tab, or open one on the default view.
@@ -548,19 +547,7 @@ impl Workspace {
         let (repo, view) = (src.repo.clone(), src.view);
         let search = src.search.read(cx).value().to_string();
         let mut tab = self.new_tab(&repo, view, window, cx);
-        let src = &self.tabs[index];
-        tab.branch = src.branch.clone();
-        tab.graph_ref = src.graph_ref.clone();
-        tab.path = src.path.clone();
-        tab.file = src.file.clone();
-        tab.commit = src.commit.clone();
-        tab.pr_filter = src.pr_filter;
-        tab.pr = src.pr;
-        tab.pr_page = src.pr_page;
-        tab.workflow = src.workflow;
-        tab.run = src.run;
-        tab.job = src.job;
-        tab.log_open = src.log_open;
+        history::Place::of(&self.tabs[index]).apply(&mut tab);
         tab.search
             .update(cx, |s, cx| s.set_value(search, window, cx));
         self.tabs.insert(index + 1, tab);
@@ -705,6 +692,7 @@ impl Workspace {
             trim(&mut d.pull_diff, 10);
             trim(&mut d.commit, 30);
             trim(&mut d.jobs, 30);
+            trim(&mut d.plan, 30);
             trim(&mut d.log, 10);
         }
     }
@@ -834,6 +822,7 @@ impl Workspace {
                             let c = gh::commit_detail(&s, path.as_deref(), &sha)?;
                             Ok(Arc::new(CommitInfo {
                                 message: c.message,
+                                meta: c.meta,
                                 diff: Arc::new(DiffView::new(c.files)),
                             }))
                         },
@@ -903,6 +892,9 @@ impl Workspace {
                         move || gh::jobs(&s, run),
                         cx,
                     );
+                    // The file at the run's commit never changes: no forced refresh.
+                    let s = slug.clone();
+                    self.fetch(&key, move |d| d.plan.entry(run).or_default(), false, move || Ok(Arc::new(gh::run_plan(&s, run)?)), cx);
                     if let (Some(job), true) = (job, log) {
                         let s = slug.clone();
                         self.fetch(
@@ -966,8 +958,8 @@ impl Workspace {
             if self.repo(&st.repo).is_none() {
                 continue;
             }
-            let mut tab = self.new_tab(&st.repo, st.view, window, cx);
-            st.apply(&mut tab);
+            let mut tab = self.new_tab(&st.repo, st.place.view, window, cx);
+            st.place.apply(&mut tab);
             if saved.active == Some(i) {
                 active = Some(self.tabs.len());
             }
@@ -992,6 +984,10 @@ impl Workspace {
     }
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.save_session();
+        if self.copied.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(1500)) {
+            self.copied = None;
+            cx.notify();
+        }
         if self.avatars.take_dirty() {
             cx.notify();
         }
@@ -1479,6 +1475,27 @@ impl Workspace {
             _ => {}
         }
         cx.notify();
+    }
+    /// Note where every tab is, so a move since the last frame becomes a step back.
+    fn record_history(&mut self) {
+        for t in &mut self.tabs {
+            let now = history::Place::of(t);
+            t.history.record(now);
+        }
+    }
+    /// Step through the active tab's history: negative goes back.
+    fn go(&mut self, steps: isize, cx: &mut Context<Self>) {
+        self.record_history();
+        let Some(t) = self.current_mut() else { return };
+        let place = if steps < 0 {
+            t.history.back(steps.unsigned_abs())
+        } else {
+            t.history.forward(steps as usize)
+        };
+        if let Some(p) = place {
+            p.apply(t);
+            cx.notify();
+        }
     }
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         if self.add_url_open {

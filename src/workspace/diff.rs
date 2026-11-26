@@ -164,9 +164,8 @@ impl Workspace {
         div()
             .id("diff-files")
             .size_full()
-            .overflow_y_scroll()
-            .px_1()
-            .child(list)
+            .overflow_y_scrollbar()
+            .child(list.px_1())
             .into_any_element()
     }
 
@@ -175,6 +174,7 @@ impl Workspace {
         id: (&'static str, u64),
         diff: Arc<DiffView>,
         scroll: UniformListScrollHandle,
+        x_scroll: ScrollHandle,
         review: Option<Review>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -384,6 +384,7 @@ impl Workspace {
                     .id(SharedString::from(format!("{}-x-{}", id.0, id.1)))
                     .size_full()
                     .overflow_x_scroll()
+                    .track_scroll(&x_scroll)
                     .map(|mut d| {
                         d.style().restrict_scroll_to_axis = Some(true);
                         d
@@ -393,6 +394,8 @@ impl Workspace {
                     .child(list),
             )
             .children(sticky)
+            .child(scrollbar_layer(SharedString::from(format!("{}-xbar-{}", id.0, id.1)), &x_scroll, ScrollbarAxis::Horizontal))
+            .child(scrollbar_layer(SharedString::from(format!("{}-ybar-{}", id.0, id.1)), &scroll, ScrollbarAxis::Vertical))
             .into_any_element()
     }
 }

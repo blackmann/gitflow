@@ -28,4 +28,8 @@ else
 fi
 
 codesign --verify --deep --strict "$destination"
+# ditto leaves the bundle directory's mtime alone, and macOS only rereads an
+# app's icon when that changes, so a new icon would keep showing the old one.
+touch "$destination" 2>/dev/null || sudo touch "$destination"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$destination"
 printf 'Installed %s\n' "$destination"

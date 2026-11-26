@@ -134,7 +134,7 @@ impl Workspace {
                     .prefix(Icon::new(IconName::Search).size(px(14.)).text_color(rgb(colors.muted)))
                     .cleanable(true),
             )
-            .child(div().id("prefs-nav").flex_1().min_h_0().overflow_y_scroll().child(nav))
+            .child(div().id("prefs-nav").flex_1().min_h_0().overflow_y_scrollbar().child(nav))
             .child(
                 row()
                     .pt_2()
@@ -512,10 +512,8 @@ impl Workspace {
                                     .id("prefs-content")
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
-                                    .px(px(40.))
-                                    .pb(px(40.))
-                                    .child(content.max_w(px(700.))),
+                                    .overflow_y_scrollbar()
+                                    .child(div().px(px(40.)).pb(px(40.)).child(content.max_w(px(700.)))),
                             ),
                     ),
             )

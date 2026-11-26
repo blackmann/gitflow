@@ -1,5 +1,6 @@
 mod avatars;
 mod cache;
+mod editors;
 mod gh;
 mod graph;
 mod icons;
@@ -37,7 +38,8 @@ fn main() {
             KeyBinding::new("cmd-4", ShowActions, None),
             KeyBinding::new("cmd-5", ShowReleases, None),
             KeyBinding::new("cmd-enter", Submit, None),
-            KeyBinding::new("cmd-[", Back, None),
+            KeyBinding::new("cmd-[", GoBack, None),
+            KeyBinding::new("cmd-]", GoForward, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -68,6 +70,9 @@ fn main() {
                     MenuItem::action("Pull Requests", ShowPulls),
                     MenuItem::action("Actions", ShowActions),
                     MenuItem::action("Releases", ShowReleases),
+                    MenuItem::separator(),
+                    MenuItem::action("Back", GoBack),
+                    MenuItem::action("Forward", GoForward),
                     MenuItem::separator(),
                     MenuItem::action("Refresh", Refresh),
                     MenuItem::action("Toggle Sidebar", ToggleSidebar),

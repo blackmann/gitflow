@@ -162,7 +162,7 @@ impl Workspace {
                     empty(colors, Glyph::CirclePlay, "No workflow runs", "Runs appear here once a workflow is triggered.").into_any_element()
                 } else {
                     let runs = Arc::new(runs.clone());
-                    uniform_list(
+                    let list = uniform_list(
                         ("runs", t.id),
                         runs.len(),
                         cx.processor(move |s, range: std::ops::Range<usize>, _, cx| {
@@ -170,8 +170,8 @@ impl Workspace {
                         }),
                     )
                     .track_scroll(t.list_scroll.clone())
-                    .size_full()
-                    .into_any_element()
+                    .size_full();
+                    scrollbars(("runs-scrollbar", t.id), &t.list_scroll, ScrollbarAxis::Vertical, list).into_any_element()
                 }
             }
         };
@@ -374,6 +374,7 @@ impl Workspace {
                         .child(r.event.replace('_', " "))
                         .child("on")
                         .child(chip(colors, mono.clone(), r.head_branch.clone()))
+                        .when(!r.head_sha.is_empty(), |s| s.child(self.sha_chip("run-head", &r.head_sha, cx)))
                         .child(div().text_color(rgb(colors.quiet)).child("·"))
                         .child(format!("started {}", self.when(util::parse_time(r.started_at.as_deref().unwrap_or(&r.created_at)), cx)))
                         .when_some(util::span(r.started_at.as_deref(), (!r.active()).then_some(r.updated_at.as_str())), |s, d| s.child(format!("· {d}"))),
@@ -383,8 +384,29 @@ impl Workspace {
             Err(p) => p.into_any_element(),
             Ok(()) => {
                 let jobs = jobs_l.and_then(|l| l.data.as_ref()).unwrap();
-                let selected = t.job.or_else(|| jobs.first().map(|j| j.database_id));
-                let mut list = col().p_1().gap(px(1.));
+                // No job chosen: the run's summary graph.
+                let selected = t.job;
+                let summary = selected.is_none();
+                let mut list = col().p_1().gap(px(1.)).child(
+                    row()
+                        .id("job-summary")
+                        .h(px(32.))
+                        .px_2()
+                        .gap_2()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .when(summary, |s| s.bg(rgb(colors.selected)))
+                        .when(!summary, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                        .child(icon(Glyph::Workflow).text_color(rgb(colors.muted)))
+                        .child(div().flex_1().child("Summary"))
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            if let Some(t) = s.current_mut() {
+                                t.job = None;
+                                t.log_open = false;
+                            }
+                            cx.notify();
+                        })),
+                );
                 for j in jobs {
                     let jid = j.database_id;
                     let active = selected == Some(jid);
@@ -425,12 +447,12 @@ impl Workspace {
                                     .border_r_1()
                                     .border_color(rgb(colors.border))
                                     .child(section(colors, format!("Jobs · {}", jobs.len())).px_3())
-                                    .child(div().id("jobs").flex_1().min_h_0().overflow_y_scroll().child(list)),
+                                    .child(div().id("jobs").flex_1().min_h_0().overflow_y_scrollbar().child(list)),
                             ),
                     )
                     .child(resizable_panel().child(match job {
                         Some(j) => self.job_pane(t, j, cx),
-                        None => empty(colors, Glyph::Workflow, "No job selected", "").into_any_element(),
+                        None => self.run_graph(t, id, jobs, cx),
                     }))
                     .into_any_element()
             }
@@ -501,7 +523,7 @@ impl Workspace {
             if j.steps.is_empty() {
                 steps = steps.child(div().p_3().text_color(rgb(colors.muted)).child("Steps appear once the job starts"));
             }
-            div().id(("steps", jid)).size_full().overflow_y_scroll().child(steps).into_any_element()
+            div().id(("steps", jid)).size_full().overflow_y_scrollbar().child(steps).into_any_element()
         };
         col().size_full().child(header).child(div().flex_1().min_h_0().child(body)).into_any_element()
     }
@@ -579,17 +601,25 @@ impl Workspace {
             })
             .child(
                 div()
-                    .id(("log-x", t.id))
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_x_scroll()
-                    .map(|mut d| {
-                        d.style().restrict_scroll_to_axis = Some(true);
-                        d
-                    })
-                    .font_family(mono)
-                    .text_size(px(size))
-                    .child(list),
+                    .child(
+                        div()
+                            .id(("log-x", t.id))
+                            .size_full()
+                            .overflow_x_scroll()
+                            .track_scroll(&t.x_scroll)
+                            .map(|mut d| {
+                                d.style().restrict_scroll_to_axis = Some(true);
+                                d
+                            })
+                            .font_family(mono)
+                            .text_size(px(size))
+                            .child(list),
+                    )
+                    .child(scrollbar_layer(("log-xbar", t.id), &t.x_scroll, ScrollbarAxis::Horizontal))
+                    .child(scrollbar_layer(("log-ybar", t.id), &t.log_scroll, ScrollbarAxis::Vertical)),
             )
             .into_any_element()
     }

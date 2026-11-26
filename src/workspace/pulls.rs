@@ -153,7 +153,7 @@ impl Workspace {
                     .into_any_element()
                 } else {
                     let shown = Arc::new(shown.into_iter().cloned().collect::<Vec<_>>());
-                    uniform_list(
+                    let list = uniform_list(
                         ("pr-list", t.id),
                         shown.len(),
                         cx.processor(move |s, range: std::ops::Range<usize>, _, cx| {
@@ -161,8 +161,8 @@ impl Workspace {
                         }),
                     )
                     .track_scroll(t.list_scroll.clone())
-                    .size_full()
-                    .into_any_element()
+                    .size_full();
+                    scrollbars(("pr-list-scrollbar", t.id), &t.list_scroll, ScrollbarAxis::Vertical, list).into_any_element()
                 }
             }
         };
@@ -578,6 +578,7 @@ impl Workspace {
                                         ("pr-diff", t.id),
                                         diff,
                                         t.diff_scroll.clone(),
+                                        t.x_scroll.clone(),
                                         Some(super::diff::Review::new(&pr.threads, t.line_target.as_ref().map(|_| t.line_rows))),
                                         cx,
                                     )))
@@ -606,6 +607,7 @@ impl Workspace {
         let colors = palette(cx);
         let mono = settings::mono(cx);
         let Some(t) = self.current() else { return div() };
+        let threads_scroll = window.use_keyed_state(("line-threads-scroll", t.id), cx, |_, _| ScrollHandle::new()).read(cx).clone();
         let threads: Vec<&gh::Thread> = pr.threads.iter().filter(|th| super::diff::thread_target(th).as_ref() == Some(&target)).collect();
         let side = if target.right { "" } else { " (removed)" };
         let lines = match &t.line_start {
@@ -667,13 +669,21 @@ impl Workspace {
             .child(header)
             .when(replying, |c| {
                 c.child(
-                    div()
-                        .id(("line-threads", t.id))
+                    col()
+                        .relative()
                         .flex_shrink()
                         .min_h_0()
                         .max_h(px(220.))
-                        .overflow_y_scroll()
-                        .child(list),
+                        .child(
+                            div()
+                                .id(("line-threads", t.id))
+                                .flex_shrink()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&threads_scroll)
+                                .child(list),
+                        )
+                        .child(scrollbar_layer(("line-threads-scrollbar", t.id), &threads_scroll, ScrollbarAxis::Vertical)),
                 )
             })
             .child(Input::new(&t.line_composer))
@@ -972,17 +982,21 @@ impl Workspace {
                     ),
             );
         }
-        div()
-            .id(("conversation", t.id))
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&t.page_scroll)
-            .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(thread))
-            .into_any_element()
+        scrollbars(
+            ("conversation-scrollbar", t.id),
+            &t.page_scroll,
+            ScrollbarAxis::Vertical,
+            div()
+                .id(("conversation", t.id))
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&t.page_scroll)
+                .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(thread)),
+        )
+        .into_any_element()
     }
     fn pr_commits(&self, pr: &gh::PullDetail, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let mono = settings::mono(cx);
         if pr.commits.is_empty() {
             return empty(colors, Glyph::Commit, "No commits", "").into_any_element();
         }
@@ -1002,21 +1016,13 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().truncate().child(c.message_headline.clone()))
                     .child(label(colors, name))
                     .child(label(colors, self.when(util::parse_time(&c.authored_date), cx)))
-                    .child(
-                        Button::new(SharedString::from(format!("pr-commit-{i}")))
-                            .label(util::short_sha(&c.oid).to_string())
-                            .ghost()
-                            .xsmall()
-                            .font_family(mono.clone())
-                            .tooltip("Copy SHA")
-                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()))),
-                    ),
+                    .child(self.sha_chip(format!("pr-commit-{i}"), &sha, cx)),
             );
         }
         div()
             .id("pr-commits")
             .size_full()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(list))
             .into_any_element()
     }
@@ -1055,7 +1061,7 @@ impl Workspace {
         div()
             .id("pr-checks")
             .size_full()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(col().p_4().max_w(px(900.)).w_full().mx_auto().child(list))
             .into_any_element()
     }

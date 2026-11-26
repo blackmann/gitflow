@@ -81,7 +81,6 @@ impl Workspace {
         let Some(head) = info.head.clone() else {
             return row().flex_1().text_color(rgb(colors.muted)).child("No commits on this branch");
         };
-        let mono = settings::mono(cx);
         // Runs for this commit decide the badge; GitHub's check rollup is the fallback.
         let state = if info.runs.iter().any(gh::Run::active) {
             Some(gh::CheckState::Pending)
@@ -138,21 +137,7 @@ impl Workspace {
                         }),
                 )
             })
-            .child(
-                div()
-                    .id("head-sha")
-                    .flex_shrink_0()
-                    .px_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(colors.hover)))
-                    .font_family(mono)
-                    .text_size(px(12.))
-                    .text_color(rgb(colors.muted))
-                    .child(util::short_sha(&sha).to_string())
-                    .tooltip(|w, cx| gpui_component::tooltip::Tooltip::new("Copy full SHA").build(w, cx))
-                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()))),
-            )
+            .child(self.sha_chip("head", &sha, cx))
             .child(div().flex_shrink_0().pr_1().text_size(px(12.)).text_color(rgb(colors.muted)).child(self.when(head.commit.time, cx)))
     }
 
@@ -299,7 +284,6 @@ impl Workspace {
         let folder = data
             .and_then(|d| d.folder.get(&key))
             .and_then(|l| l.data.clone());
-        let mono = settings::mono(cx);
         for (i, e) in entries.iter().enumerate() {
             let last = folder.as_ref().and_then(|f| f.files.get(&e.path));
             let dir = e.is_dir();
@@ -330,15 +314,7 @@ impl Workspace {
                             .child(last.map(|c| c.message.clone()).unwrap_or_default()),
                     )
                     .when_some(last, |s, c| {
-                        s.child(
-                            div()
-                                .w(px(62.))
-                                .flex_shrink_0()
-                                .font_family(mono.clone())
-                                .text_size(px(11.5))
-                                .text_color(rgb(colors.quiet))
-                                .child(util::short_sha(&c.sha).to_string()),
-                        )
+                        s.child(div().w(px(96.)).flex_shrink_0().child(self.sha_chip(format!("entry-{i}"), &c.sha, cx)))
                         .child(
                             div()
                                 .w(px(76.))
@@ -409,13 +385,13 @@ impl Workspace {
                     })),
             );
         }
-        div()
-            .id(("folder-scroll", t.id))
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&t.page_scroll)
-            .child(page)
-            .into_any_element()
+        scrollbars(
+            ("folder-scrollbar", t.id),
+            &t.page_scroll,
+            ScrollbarAxis::Vertical,
+            div().id(("folder-scroll", t.id)).size_full().overflow_y_scroll().track_scroll(&t.page_scroll).child(page),
+        )
+        .into_any_element()
     }
 
     fn file_view(&self, colors: Palette, t: &Tab, branch: &str, file: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -525,13 +501,7 @@ impl Workspace {
                                             c.message,
                                             util::short_sha(&c.sha)
                                         ))
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            if let Some(t) = s.current_mut() {
-                                                t.view = View::Commits;
-                                                t.commit = Some(sha.clone());
-                                            }
-                                            cx.notify();
-                                        })),
+                                        .on_click(cx.listener(move |s, _, _, cx| s.open_commit(sha.clone(), cx))),
                                 )
                             })
                     })
@@ -548,17 +518,25 @@ impl Workspace {
         .min_w(px(width))
         .w_full();
         div()
-            .id(("file-x", tab))
+            .relative()
             .size_full()
-            .overflow_x_scroll()
-            .map(|mut d| {
-                d.style().restrict_scroll_to_axis = Some(true);
-                d
-            })
-            .font_family(mono)
-            .text_size(size)
-            .pt_1()
-            .child(list)
+            .child(
+                div()
+                    .id(("file-x", tab))
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&t.x_scroll)
+                    .map(|mut d| {
+                        d.style().restrict_scroll_to_axis = Some(true);
+                        d
+                    })
+                    .font_family(mono)
+                    .text_size(size)
+                    .pt_1()
+                    .child(list),
+            )
+            .child(scrollbar_layer(("file-xbar", tab), &t.x_scroll, ScrollbarAxis::Horizontal))
+            .child(scrollbar_layer(("file-ybar", tab), &t.list_scroll, ScrollbarAxis::Vertical))
             .into_any_element()
     }
 }

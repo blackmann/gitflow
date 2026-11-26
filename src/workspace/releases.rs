@@ -36,13 +36,14 @@ impl Workspace {
         if state.item_count() != releases.len() {
             state.reset(releases.len());
         }
-        list(
-            state,
+        let list = list(
+            state.clone(),
             cx.processor(|s, i: usize, window, cx| s.release_card(i, window, cx)),
         )
-        .size_full()
-        .bg(rgb(colors.background))
-        .into_any_element()
+        .size_full();
+        scrollbars(("releases-scrollbar", t.id), &state, ScrollbarAxis::Vertical, list)
+            .bg(rgb(colors.background))
+            .into_any_element()
     }
 
     fn release_card(&self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
